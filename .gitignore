@@ -1,0 +1,26 @@
+# 模型权重 / 数据集 / 运行产物 不进仓库（架构约定 §7.9）
+models/
+datasets/
+runs/
+cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# 虚拟环境
+.venv/
+venv/
+
+# 标注工具独立环境产物
+label_studio/
+
+# IDE / 系统
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db

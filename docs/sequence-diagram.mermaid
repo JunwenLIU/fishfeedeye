@@ -1,0 +1,68 @@
+%% 流程一：主分析（单视频）
+sequenceDiagram
+    participant U as 用户(Gradio)
+    participant ORC as Orchestrator
+    participant ING as Ingest+Timing
+    participant PRE as Preprocess
+    participant DET as PelletDetector(双轨)
+    participant LNK as PelletLinker
+    participant AGG as Aggregator
+    participant Q as QualitySignals
+    participant CAP as CapabilityGate
+    participant EXP as Export
+
+    U->>ORC: run(video, RunMeta, RunConfig)
+    ORC->>ING: 解码 + 时间轴(PTS优先) + VFR检测
+    ING-->>ORC: FrameObservation[] (非对称采样≈114帧)
+    ORC->>PRE: CLAHE + 掩膜 + 透视校正
+    PRE-->>ORC: 校正后帧
+    ORC->>DET: detect(frame) 逐帧
+    DET-->>ORC: PelletDetections（检测轨 + 面积积分轨）
+    ORC->>LNK: 时空最近邻关联(仅密集窗口)
+    LNK-->>ORC: Track[] + 消失三分类(eaten/drifted/unknown)
+    ORC->>ORC: cache/detections.jsonl 落盘
+    ORC->>AGG: aggregate(frames, tracks)
+    AGG->>Q: compute(13个Q_*)
+    Q-->>AGG: quality dict
+    AGG-->>ORC: {metric_id: MetricValue}
+    ORC->>CAP: apply(signals, meta) 降级矩阵
+    CAP-->>ORC: enabled + disabled_with_reason
+    ORC->>EXP: 六件套 + run_config.yaml
+    EXP-->>U: 完成通知 + 结果页
+
+---
+%% 流程二：人工修正（只重跑 metrics 层）
+sequenceDiagram
+    participant U as 用户
+    participant RES as Results页
+    participant ORC as Orchestrator
+    participant AGG as Aggregator
+    participant EXP as Export
+
+    U->>RES: 在时间轴选帧, 输入修正颗粒数
+    RES->>ORC: recompute_metrics(run_id, corrections)
+    ORC->>ORC: 读 cache/detections.jsonl（不重跑检测）
+    ORC->>AGG: 用修正后序列重算全部指标
+    AGG-->>ORC: 新 MetricValue 集
+    ORC->>EXP: 重写六件套 + corrections.jsonl 追加留痕
+    EXP-->>U: 曲线刷新, 修正量可见(共N帧, 占X%)
+
+---
+%% 流程三：两组统计比较
+sequenceDiagram
+    participant U as 用户
+    participant CMP as Compare页
+    participant CP as ComparisonPlan
+    participant CHK as run_config diff
+    participant ST as TwoGroup统计
+
+    U->>CMP: 选两组成员 runs
+    CMP->>CP: build TwoGroupPlan(runs, group_map)
+    CP->>CHK: diff 七条规则(spec_version/model_md5/t0_*/window_s/ROI/px_per_mm/采样)
+    alt 不一致
+        CHK-->>U: 拒绝 + 列出差异 + "重跑对齐约4秒"
+    else 一致
+        CP->>ST: 逐指标 execute(A8_T50, A11_RR, ...)
+        ST->>ST: 可用集差异检查(非随机缺失告警) + 伪重复检查(pond_id)
+        ST-->>U: p值 + Cohen's d + 95%CI + 检验方法 + n + 重复结构说明
+    end

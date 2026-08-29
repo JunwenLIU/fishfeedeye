@@ -1,0 +1,38 @@
+# 鱼类摄食行为视频分析工具 · 主环境依赖
+# 任务: T01 · 项目基础设施 + 核心契约层
+# 环境: Python 3.11.4 (项目虚拟环境 .venv，基于系统 C:\Program Files\Python311 创建)
+#
+# ⚠️ torch/torchvision 必须安装 CUDA 12.6 版本（本机 RTX 3060 Ti + CUDA Toolkit 12.6 + 驱动 610.74），
+#    不要从默认 PyPI 源安装（会得到 CPU 版）：
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#
+# Label Studio 标注工具使用独立虚拟环境（见 requirements-labeling.txt，P1 阶段使用），不在此文件中。
+
+# ---- 深度学习（cu126 版，见顶部注释）----
+torch>=2.6.0
+torchvision>=0.21.0
+
+# ---- 检测 / 跟踪 / 切片推理 ----
+ultralytics>=8.3.0
+supervision>=0.25.0
+sahi>=0.11.0            # 依赖 shapely；Windows pip 失败时改用 conda-forge
+
+# ---- 传统 CV / 数值 ----
+opencv-python>=4.11.0
+numpy>=2.0.0
+scipy>=1.14.0
+pandas>=2.2.0
+
+# ---- UI ----
+gradio>=5.0.0
+
+# ---- 统计 ----
+pingouin>=0.5.5
+statsmodels>=0.14.0
+
+# ---- 图表 ----
+matplotlib>=3.9.0
+
+# ---- 配置 / 测试 ----
+pyyaml>=6.0
+pytest>=8.0.0

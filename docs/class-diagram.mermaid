@@ -1,0 +1,142 @@
+classDiagram
+    class RunConfig {
+        +str metrics_spec_version
+        +SamplingParams sampling
+        +Thresholds thresholds
+        +str model_md5
+        +str t0_definition
+        +str t0_source
+        +dict homography
+        +float px_per_mm_ref
+        +str pellet_type
+        +to_yaml(path) void
+        +from_yaml(path) RunConfig
+        +diff(other) list~str~
+    }
+    class RunMeta {
+        +str species
+        +int n_fish_total
+        +float body_length_mm
+        +float feed_mass_g
+        +float pellet_mass_mg
+        +str pellet_type
+        +str pond_id
+        +str group_label_encrypted
+        +str blind_code
+        +cross_validate() list~str~
+    }
+    class MetricValue {
+        +str metric_id
+        +float~None~ value
+        +str unit
+        +str status
+        +str~None~ reason
+        +tuple flags
+        +dict quality
+        +str unit_scale
+        +__post_init__() void
+        +_check_unit_scale() void
+        +blocking_flags() list~str~
+    }
+    class FrameObservation {
+        +int frame_idx
+        +float t_s
+        +float dt_s
+        +ndarray image
+        +PelletDetections pellets
+        +dict extra
+    }
+    class PelletDetections {
+        +ndarray xyxy
+        +ndarray conf
+        +list~str~ vanish_class
+        +n_det() int
+    }
+    class ROI {
+        +ndarray feeding_zone
+        +ndarray reference_zone
+        +list~ndarray~ exclude_zones
+        +contains(point) bool
+        +mask(shape) ndarray
+    }
+    class HomographyCalibrator {
+        +ndarray H
+        +fit(frame_corners, world_corners_m) bool
+        +px_per_mm(x, y) float
+        +warp(frame) ndarray
+    }
+    class PelletDetector {
+        <<abstract>>
+        +detect(frame) PelletDetections
+        +name() str
+    }
+    class YoloPelletDetector {
+        -model
+        +detect(frame) PelletDetections
+    }
+    class YoloEDetector {
+        -model
+        +detect(frame) PelletDetections
+    }
+    class AreaIntegralCounter {
+        -A_single_t
+        +detect(frame) PelletDetections
+        +set_A_single(curve) void
+    }
+    class PelletLinker {
+        -v_sink_max
+        -association_radius
+        +link(frames) list~Track~
+        +classify_vanish(track) str
+    }
+    class Orchestrator {
+        +run(video, meta, config, progress) RunResult
+        +load_cache(run_id) RunResult
+        +recompute_metrics(run_id, corrections) RunResult
+    }
+    class QualitySignals {
+        +dict signals
+        +compute(frames, tracks) dict
+    }
+    class CapabilityGate {
+        +dict enabled
+        +list disabled_with_reason
+        +apply(signals, meta) CapabilityReport
+    }
+    class Aggregator {
+        +aggregate(frames, tracks, signals) dict~str,MetricValue~
+    }
+    class ComparisonPlan {
+        <<abstract>>
+        +list runs
+        +dict group_map
+        +validate() list~str~
+    }
+    class TwoGroupPlan {
+        +str test_model
+        +execute(metric_id) TestResult
+    }
+    class TallyRecorder {
+        +on_key(timestamp_s) void
+        +to_csv(path) void
+        +series() list~float,int~
+    }
+
+    RunConfig --> MetricValue : 量纲门 Q_calib
+    RunMeta --> MetricValue : 依赖字段
+    FrameObservation o-- PelletDetections
+    Orchestrator --> RunConfig
+    Orchestrator --> RunMeta
+    Orchestrator --> PelletDetector : 策略
+    Orchestrator --> PelletLinker
+    Orchestrator --> Aggregator
+    PelletDetector <|-- YoloPelletDetector
+    PelletDetector <|-- YoloEDetector
+    PelletDetector <|-- AreaIntegralCounter
+    AreaIntegralCounter ..> HomographyCalibrator : A_single 尺度校正
+    Aggregator --> QualitySignals
+    Aggregator --> MetricValue : 产出
+    CapabilityGate --> QualitySignals : 消费
+    ComparisonPlan <|-- TwoGroupPlan
+    TwoGroupPlan --> ComparisonPlan
+    TallyRecorder ..> FrameObservation : 对照

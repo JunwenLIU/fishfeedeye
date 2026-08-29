@@ -1,0 +1,61 @@
+# default.yaml · 全局默认配置（T01）
+# 来源: docs/04-metrics-input-contract.md §5 阈值常量表（v4 冻结版，逐条照抄）
+# 纪律:
+#   - metrics_spec_version 必须是第一个键（跨 run 比较的必校项，compare.py 硬校验）
+#   - 所有阈值随结果导出到 runs/<run_id>/run_config.yaml（可复现锚点）
+#   - v_sink_max_mm_s / association_radius_px 由 scripts/00_calibrate_pellet_dynamics.py
+#     用「无鱼纯饲料」标定视频实测得到，禁止硬编码默认值（故为 null）
+#   - 任何修改本文件的行为都会使跨 run 比较触发"参数不一致"拒绝/告警
+
+# =====================================================================
+# 指标规范版本（第一个键，冻结）
+# =====================================================================
+metrics_spec_version: ms-v1
+
+# =====================================================================
+# 非对称采样参数（硬设计，非优化；docs/06 T02）
+# 基线 [-60s,0) 间隔 2s；早期 [0,60s] 间隔 1s；尾段 (60s,300s] 间隔 10s
+# 尾段终点 = thresholds.observation_window_s
+# =====================================================================
+sampling:
+  baseline_interval_s: 2.0
+  early_interval_s: 1.0
+  tail_interval_s: 10.0
+  baseline_window_s: 60        # 基线窗口长度（最短 30，见 thresholds.baseline_window_s）
+  early_window_s: 60           # 早期密集段上界 [t0, t0+60s]（= a14 密集采样窗口）
+
+# =====================================================================
+# 阈值常量表（docs/04 §5）
+# =====================================================================
+thresholds:
+  baseline_window_s: 60            # 基线窗口长度（最短 30）
+  n0_early_window_s: 30            # N₀ 搜索窗口
+  n0_gap_warn: 0.20                # N₀ 交叉校验偏差告警阈值
+  # t100_epsilon 契约定义为 max(2, 0.02×N0)，拆为两个常量表达：
+  t100_epsilon_min_pellets: 2      # 清空判定残留阈值下限（颗）
+  t100_epsilon_frac: 0.02          # 清空判定残留阈值比例（×N₀）
+  observation_window_s: 300        # 残留率 RR 的固定观察窗
+  smooth_window: 5                 # 颗粒曲线平滑窗口（采样点数）
+  pellet_saturation: 500           # 单帧颗粒计数饱和阈值（密集粘连）
+  pelletloss_degrade: 0.15         # 非摄食损失率降级阈值
+  q_det_min: 0.50                  # 颗粒检测置信度门限
+  q_track_min: 0.50                # 可追踪个体比例门限
+  q_interf_max: 0.30               # 反光污染帧占比门限
+  q_fg_min: 0.01                   # 前景像素占比门限
+  annd_min_n: 5                    # ANND 最小个体数
+  fiffb_min_n: 8                   # FIFFB 最小个体数
+  fit_min_points: 8                # 曲线拟合最少点数
+  fit_r2_min: 0.60                 # 拟合 R² 门限（低于则不输出）
+  onset_sigma: 3.0                 # 摄食起始判据 σ 倍数（D2）
+  onset_hold_s: 1.0                # 摄食起始持续时长（D2）
+  offset_sigma: 2.0                # 饱和判据 σ 倍数（D3）
+  offset_hold_s: 3.0               # 饱和持续时长（D3）
+  density_low_max: 15              # 密度分档 LOW 上限（Q_vis ≤ 15 → LOW）
+  density_med_max: 40              # 密度分档 MED 上限（> 40 → HIGH）
+  vigor_ratio_high: 3.0            # 烈度分档：峰/基 > 此值 → VIGOROUS（仅自动建议值，不得驱动关闭）
+  vigor_ratio_low: 1.5             # 烈度分档：峰/基 ≤ 此值 → GENTLE（同上）
+  v_sink_max_mm_s: null            # ★ 需实测标定（无鱼视频 95 分位沉降速度），禁止硬编码默认值
+  association_radius_px: null      # ★ 需标定（建议 2–3 倍平均粒径），满足 v_sink_max×Δt < association_radius
+  a14_window_s: 60                 # A14 关联有效窗口（= 密集采样窗口）；观察窗更长则 partial_window=True
+  integral_method: trapz           # 积分方法固定为基于真实 dt 的梯形法，不得改为等间隔求和
+  export_1hz_timeseries: false     # 1 Hz 插值版 CSV 默认不导出（插值数据不可用于积分/统计）
