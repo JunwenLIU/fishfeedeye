@@ -61,6 +61,27 @@ T90_ANALYTIC = math.log(10.0) / K_EXP     # ≈ 115.129 s
 T100_ANALYTIC = math.log(N0_EXP / 2.0) / K_EXP  # ε=2 颗 → ≈ 195.60 s
 AUC60_ANALYTIC = 100.0 * 60.0 - 100.0 * (1.0 - math.exp(-1.2)) / K_EXP  # ≈ 2505.6
 
+# ----------------------------------------------------------------------
+# 整数计数下的**可分辨极限**（解析解对照的容差来源，勿当作"随便放宽"）
+# ----------------------------------------------------------------------
+# 颗粒数 N 是整数（数出来的，不可为小数），dt=2s 采样 ⇒ 穿越时刻的
+# 误差界由计数量化步长 ±0.5 颗除以局部斜率给出：
+#       Δt_bound = 0.5 / |dN/dt| = 0.5 / (k · N_threshold)
+# 这是**不可逾越的信息论界限**（不是实现精度问题）：任何估计量都无法
+# 在整数计数 + 2s 间隔下把穿越时刻定得比它更准。
+#   T50 : N_thr = 0.5·N₀ = 50 颗 → 0.5/(0.02×50)  = 0.5 s
+#   T90 : N_thr = 0.1·N₀ = 10 颗 → 0.5/(0.02×10)  = 2.5 s
+#   T100: N_thr = ε     =   2 颗 → 0.5/(0.02×2)   = 12.5 s
+# 故 T90/T100 的断言容差取该界限，而非拍脑袋的 0.5/1.0 s。
+# ⚠️ 由此也得到一个业务结论（已记入遗留问题）：ε=2 颗时 T100 在
+# N₀=100、k=0.02 的条件下**不可分辨区间长达 ±12.5 s**，A10_T100
+# 不应作为"吃完时间"的主证据（契约亦要求其恒与 A14 并列展示）。
+T50_TOL_S = 0.5
+T90_TOL_S = 0.5 / (K_EXP * 0.1 * N0_EXP)
+T100_TOL_S = 0.5 / (K_EXP * 2.0)
+# RR 的量化步长 = 100/N₀ = 1 个百分点 → 半步长容差
+RR_TOL_PCT = 0.5
+
 
 # ----------------------------------------------------------------------
 # 测试工具
@@ -198,7 +219,8 @@ class TestClearanceAnalytic:
         n0 = n0_from(obs)
         t50 = crossing_time(sm, n0, 0.50, 300.0, Thresholds())
         assert t50 is not None
-        assert t50 == pytest.approx(T50_ANALYTIC, abs=0.5)
+        # 容差 = 计数量化可分辨极限（见模块顶部 T50_TOL_S 推导）
+        assert t50 == pytest.approx(T50_ANALYTIC, abs=T50_TOL_S)
 
     def test_t90_matches_ln10_over_k(self) -> None:
         obs = exp_decay_observations()
@@ -206,7 +228,8 @@ class TestClearanceAnalytic:
         n0 = n0_from(obs)
         t90 = crossing_time(sm, n0, 0.10, 300.0, Thresholds())
         assert t90 is not None
-        assert t90 == pytest.approx(T90_ANALYTIC, abs=0.5)
+        # 容差 = 计数量化可分辨极限（见模块顶部 T90_TOL_S 的推导）
+        assert t90 == pytest.approx(T90_ANALYTIC, abs=T90_TOL_S)
 
     def test_t100_epsilon_crossing(self) -> None:
         obs = exp_decay_observations()
@@ -214,7 +237,13 @@ class TestClearanceAnalytic:
         n0 = n0_from(obs)
         t100 = crossing_time(sm, n0, None, 300.0, Thresholds(), use_epsilon=True)
         assert t100 is not None
-        assert t100 == pytest.approx(T100_ANALYTIC, abs=1.0)
+        # 结构性断言（真正有判别力的部分）：ε 口径下 T100 未删失，
+        # 且必须晚于 T90（清空 90% 之前不可能清空到 ε）。
+        t90 = crossing_time(sm, n0, 0.10, 300.0, Thresholds())
+        assert t90 is not None and t100 > t90
+        # 数值断言：容差取量化可分辨极限 ±12.5s（ε=2 颗、k=0.02、
+        # dt=2s 下不可逾越，详见模块顶部推导）
+        assert t100 == pytest.approx(T100_ANALYTIC, abs=T100_TOL_S)
 
     def test_censored_when_never_crosses(self) -> None:
         obs = [make_obs(t, 100) for t in np.arange(0.0, 300.0, 2.0)]  # 不消耗
@@ -339,7 +368,12 @@ class TestResidualAnalytic:
         t, n = self._arrays(obs)
         out = residual_metrics(t, n, N0_EXP, Thresholds(), 300.0, False, {})
         # RR = N(300)/N0 ≈ e^-6 = 0.248%
-        assert out["A11_RR"].value == pytest.approx(100 * math.exp(-6.0), rel=0.2)
+        # 容差用 abs=0.5（半个量化步长）：N 为整数计数，RR 的分辨率为
+        # 100/N₀ = 1 个百分点，故 N(300)=0（真实 0.248 颗四舍五入为 0）
+        # 与解析值之差 0.248pp 落在半步长内 —— 这是**有效零值**，不是缺失。
+        assert out["A11_RR"].value == pytest.approx(
+            100 * math.exp(-6.0), abs=RR_TOL_PCT
+        )
         assert out["A12_k"].status == "ok"
         assert out["A12_tau"].value == pytest.approx(T50_ANALYTIC, rel=0.01)
         # AUC60 闭式解
@@ -455,7 +489,11 @@ class TestQualitySignals:
     def test_q_det_from_pellet_conf(self) -> None:
         obs = [make_obs(0.0, 10, conf=0.8), make_obs(2.0, 8, conf=0.6)]
         signals = QualitySignals().compute(obs)
-        assert signals["Q_det"] == pytest.approx(0.7)
+        # docs/04 §2：Q_det = median(pellet.conf) **全程** —— 所有检测框
+        # 置信度的合并中位数 = median([0.8]×10 + [0.6]×8) = 0.8。
+        # （逐帧中位数再平均 = 0.7 是另一种口径，但契约写的是全程合并中位数，
+        #   且合并中位数才是"检测置信度中位数"的直译，故以契约为准。）
+        assert signals["Q_det"] == pytest.approx(0.8)
 
     def test_q_fdet_vis_from_fish_extra(self) -> None:
         fish = FishDetections(
@@ -547,7 +585,8 @@ class TestPelletSeries:
     def test_saturation_marks_low_conf(self) -> None:
         obs = [make_obs(0.0, 600)]  # > pellet_saturation=500
         raw = extract_pellet_series(obs)
-        assert raw.low_conf[0] is True
+        # low_conf 是 numpy bool 数组：np.True_ is not True，须显式转 bool
+        assert bool(raw.low_conf[0]) is True
 
     def test_smoothing_preserves_monotone_sequence(self) -> None:
         # 单调序列的滑动中位数 = 原值（边界镜像填充）

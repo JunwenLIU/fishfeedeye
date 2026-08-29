@@ -36,8 +36,14 @@ __all__ = [
 ]
 
 NO_NOISE_CORRECTION_FLAG = "no_noise_correction"
-# 与 T02 preprocess.ReferenceZoneCorrector 对齐（min_baseline_samples=8）。
-MIN_BASELINE_SAMPLES = 8
+# 基线期回归 α 的最小样本数（docs/04 §5 未给此阈值 → 工程取值 5）。
+# 取值依据：过原点最小二乘只有 1 个自由度参数，5 个基线期样本足以辨识 α；
+# 少于 5 时 α 的抽样误差过大，按契约「α 必须由基线回归得到，不设默认值」
+# 处理为不可估计 + no_noise_correction 告警。
+# 注：T02 preprocess.ReferenceZoneCorrector.min_baseline_samples=8 属于
+# **逐像素**层面的另一条链路（样本量充裕得多），与本处的曲线级口径不同源，
+# 不强行对齐（此前声称"对齐"是错的：两者样本量级差两个数量级）。
+MIN_BASELINE_SAMPLES = 5
 
 
 def estimate_alpha(
@@ -50,7 +56,7 @@ def estimate_alpha(
     Args:
         feed_signal: 投喂区信号序列（基线期）。
         ref_signal: 参考区信号序列（与 feed 一一对应）。
-        min_samples: 最小基线样本数（默认 8，与 T02 口径一致）。
+        min_samples: 最小基线样本数（默认 MIN_BASELINE_SAMPLES=5）。
 
     Returns:
         (alpha, note)：alpha=None 时 note 给出不可估计原因。
@@ -85,6 +91,18 @@ def no_reference_warning() -> str:
     )
 
 
+def _warning_with_reason(reason: str | None) -> str:
+    """把"具体失效原因"拼进告警文案。
+
+    为什么：只说"未做噪声扣除"，用户无从判断该补参考区还是延长基线段。
+    告警必须自带可执行的下一步（docs/04 §4.5 排查引导纪律）。
+    """
+    base = no_reference_warning()
+    if not reason:
+        return base
+    return f"{base}；原因：{reason}"
+
+
 @dataclass
 class ReferenceCorrectionResult:
     """ReferenceCorrection.fit 的产物。
@@ -92,8 +110,13 @@ class ReferenceCorrectionResult:
     Attributes:
         alpha: 扣除系数（None = 不可估计，绝不默认 0/1 冒充）。
         n_samples: 参与回归的基线期样本数。
-        warning: α 不可得时的告警（None = 校正有效）。
+        warning: α 不可得时的告警（None = 校正有效）。告警由通报文案 +
+            **具体失效原因**（无参考区 / 样本不足 / 零变异）拼成——
+            用户据此才知道该补参考区还是补基线段，故 warning 必须自带原因。
         note: 附加口径说明。
+
+    @property
+        available: α 是否可用（不可用时调用方必须挂 no_noise_correction）。
     """
 
     alpha: float | None = None
@@ -142,37 +165,41 @@ class ReferenceCorrection:
             （无参考区 / 样本不足 / 零变异，三个失效分支全覆盖）。
         """
         if not self.has_reference_zone():
+            note = "ROI.reference_zone 未定义：无噪声参照，不做扣除"
             return ReferenceCorrectionResult(
                 alpha=None,
                 n_samples=0,
-                warning=no_reference_warning(),
-                note="ROI.reference_zone 未定义：无噪声参照，不做扣除",
+                warning=_warning_with_reason(note),
+                note=note,
             )
         pairs = list(baseline_pairs)
         n = len(pairs)
         if n == 0:
+            note = "基线期无帧差样本（无基线或基线帧无图像）：α 不可估计"
             return ReferenceCorrectionResult(
                 alpha=None,
                 n_samples=0,
-                warning=no_reference_warning(),
-                note="基线期无帧差样本（无基线或基线帧无图像）：α 不可估计",
+                warning=_warning_with_reason(note),
+                note=note,
             )
         feed = np.asarray([p[0] for p in pairs], dtype=float)
         ref = np.asarray([p[1] for p in pairs], dtype=float)
         if n < self._min_samples:
+            note = (
+                f"基线期样本不足（{n} < {self._min_samples}）："
+                "α 必须由基线回归得到，不设默认值"
+            )
             return ReferenceCorrectionResult(
                 alpha=None,
                 n_samples=n,
-                warning=no_reference_warning(),
-                note=(
-                    f"基线期样本不足（{n} < {self._min_samples}）："
-                    "α 必须由基线回归得到，不设默认值"
-                ),
+                warning=_warning_with_reason(note),
+                note=note,
             )
         alpha, note = estimate_alpha(feed, ref, self._min_samples)
         if alpha is None:
             return ReferenceCorrectionResult(
-                alpha=None, n_samples=n, warning=no_reference_warning(), note=note
+                alpha=None, n_samples=n,
+                warning=_warning_with_reason(note), note=note,
             )
         return ReferenceCorrectionResult(
             alpha=alpha,

@@ -1,10 +1,12 @@
-"""scripts/run_cli.py · 无 UI 命令行入口（T02 最小闭环）。
+"""scripts/run_cli.py · 无 UI 命令行入口（T02 最小闭环 / T04 完整闭环）。
 
-职责（docs/06 §6 T02 验收 1 + 最小闭环）：
+职责（docs/06 §6 T02 验收 1 + T04 验收 4 + 最小闭环）：
     python scripts/run_cli.py --video demo.mp4 --config configs/default.yaml
     走通 ingest → preprocess；无检测器时输出采样帧清单（帧号/t_s/dt_s/
     基线标记）。提供 --detectors / --calibration 后串接双轨检测与关联
-    （T03），结果落 runs/<run_id>/。
+    （T03）；**提供 --meta 后继续串接曲线 → 指标 → 质量 → 报告（T04）**，
+    落盘 metrics_summary.csv（17 列冻结）/ quality_signals.csv /
+    flag_glossary.csv / metrics_timeseries.csv / summary.json。
 
 用法示例：
     # 仅接入+预处理（采样清单）
@@ -14,6 +16,11 @@
     python scripts/run_cli.py --video demo.mp4 --meta meta.json \
         --t0 65.0 --roi roi.json --calibration configs/calibration/feedA.yaml \
         --detectors area
+
+    # 完整闭环（含 B1 帧差活跃度：保留采样帧图像，小视频/测试用）
+    python scripts/run_cli.py --video demo.mp4 --meta meta.json --t0 65.0 \
+        --roi roi.json --calibration configs/calibration/feedA.yaml \
+        --detectors area --keep-images
 
     # 开放词汇检测轨（需 ultralytics；自动回退面积轨）
     python scripts/run_cli.py --video demo.mp4 --detectors auto ...
@@ -60,6 +67,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--resume-run", default=None, help="续跑：既有 run 目录")
     ap.add_argument("--list-frames", action="store_true",
                     help="无检测器时打印完整采样帧清单")
+    ap.add_argument("--keep-images", action="store_true",
+                    help="保留采样帧图像供 B1 帧差活跃度 / D 组起止计算"
+                         "（内存随帧数线性增长，仅小视频或测试用；"
+                         "不开启时 B1/D 组按契约输出 unavailable + reason）")
+    ap.add_argument("--outdoor", action="store_true",
+                    help="户外斜拍机位（用户确认）：B2/C 组降级为探索性输出")
     return ap.parse_args(argv)
 
 
@@ -151,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             detectors=detectors,
             linker=linker if detectors else None,
             run_dir=args.resume_run,
+            keep_images=args.keep_images,
             progress=lambda stage, frac: print(
                 f"[run_cli] {stage} {frac:>5.0%}", file=sys.stderr
             ) if frac in (0.0, 0.3, 0.5, 0.9, 1.0) else None,
@@ -192,6 +206,49 @@ def main(argv: list[str] | None = None) -> int:
                   f"eaten={lr.n_eaten} drifted={lr.n_drifted} unknown={lr.n_unknown}")
         if result.quality_signals:
             print(f"[run_cli] 质量信号: {result.quality_signals}")
+
+    # ---- 指标 → 质量 → 报告（T04 闭环；需 --meta）----
+    if meta is None:
+        print("[run_cli] 未提供 --meta：跳过指标层"
+              "（指标需要 RunMeta 的 N₀ 交叉校验与 pellet_type 门控）")
+        return 0
+
+    from src.metrics import compute_run_metrics, write_run_outputs
+
+    report = compute_run_metrics(
+        result, roi=roi, outdoor=args.outdoor
+    )
+    written = write_run_outputs(report, result.run_dir)
+    # RunMeta 留档（corrections.jsonl 之外的输入留痕；compute_metrics_from_run_dir 消费）
+    meta_path = result.run_dir / "meta.json"
+    meta_path.write_text(
+        json.dumps(meta.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    print(f"\n[run_cli] 指标层完成：{len(report.metrics)} 个指标，"
+          f"观察窗 {report.window_s:.0f}s"
+          f"{'（截断）' if report.window_truncated else ''}")
+    print(f"[run_cli] 组可用数: "
+          + ", ".join(f"{g}={len(d)}" for g, d in report.groups.items()))
+    for mid in ("A1_N0", "A8_T50", "A9_T90", "A10_T100", "A11_RR",
+                "A12_tau", "A14_NonFeedingLoss", "B1_frame_diff",
+                "B2-7_RP", "D2_T_start"):
+        mv = report.metrics.get(mid)
+        if mv is None:
+            continue
+        shown = "—" if mv.value is None else f"{mv.value:.3f}"
+        print(f"[run_cli]   {mid:<20} {shown:>10} {mv.unit or '':<8} "
+              f"{mv.status:<12} {mv.reason or ''}")
+    for w in report.warnings:
+        print(f"[run_cli] ⚠ {w}")
+    for n in report.notes:
+        print(f"[run_cli] note: {n}")
+    if report.capability is not None:
+        for entry in report.capability.disabled_with_reason:
+            print(f"[run_cli] ✗ 关闭 {entry.metric}: {entry.reason}")
+    print("[run_cli] 落盘: " + ", ".join(
+        str(p.relative_to(result.run_dir)) for p in written
+    ) + f", {meta_path.name}")
     return 0
 
 

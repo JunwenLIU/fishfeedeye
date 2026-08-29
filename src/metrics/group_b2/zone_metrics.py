@@ -29,13 +29,28 @@ from src.metrics.group_a.pellet_curve import TimeSeries
 __all__ = ["zone_metrics"]
 
 
+def _as_obs_list(
+    observations: Sequence[FrameObservation] | FrameObservation,
+) -> list[FrameObservation]:
+    """归一化入参为观测列表（容错：也接受单个 FrameObservation）。
+
+    为什么需要：单帧调用是本层最常见的手误（写 `zone_metrics(obs, ...)`
+    漏了方括号），原实现会在 `sorted(...)` 处抛
+    "FrameObservation object is not iterable"——一个与业务语义无关的
+    TypeError，排查成本高。此处显式容错，行为与传入 `[obs]` 完全一致。
+    """
+    if isinstance(observations, FrameObservation):
+        return [observations]
+    return list(observations)
+
+
 def _n_fz_series(
-    observations: Sequence[FrameObservation],
+    observations: Sequence[FrameObservation] | FrameObservation,
     feed_zone: np.ndarray | None,
 ) -> TimeSeries | None:
     """N_fz(t) 时序（有鱼体数据的帧；无任何数据 → None）。"""
     rows: list[tuple[float, float]] = []
-    for obs in sorted(observations, key=lambda o: o.t_s):
+    for obs in sorted(_as_obs_list(observations), key=lambda o: o.t_s):
         fish = obs.extra.get("fish")
         if not isinstance(fish, FishDetections) or fish.n_det() == 0:
             if isinstance(fish, FishDetections):
@@ -56,7 +71,7 @@ def _n_fz_series(
 
 
 def zone_metrics(
-    observations: Sequence[FrameObservation],
+    observations: Sequence[FrameObservation] | FrameObservation,
     roi: ROI | None,
     meta: RunMeta,
     baseline: BaselineStats | None,
@@ -66,6 +81,7 @@ def zone_metrics(
     """计算 B2-5/B2-6/B2-7。Returns: (metrics, N_fz 时序)。
 
     Args:
+        observations: 帧观测序列（也容错接受单个 FrameObservation）。
         outdoor: 户外斜拍（用户确认）→ B2 标量 degraded + outdoor_exploratory；
             室内（默认 False）正常输出（降级交给 capability 门控）。
     """

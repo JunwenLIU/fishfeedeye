@@ -1,9 +1,9 @@
-"""aggregator.py · 指标汇总与导出（T04 业务核心，最终收口版）。
+"""aggregator.py · 指标汇总与导出（T04 业务核心，收口版）。
 
 职责（docs/06 §6 T04 + docs/04 §6.3 + team-lead 派单）：
     - 消费 FrameObservation 时序 → A 组（颗粒曲线族）/ B1（活跃度 + 空间
       异质性）/ B2（投喂区）/ D（起止时刻）标量与时序，全部经 MetricValue；
-    - 13 个 Q_* 质量信号（quality.py）→ 降级矩阵（capability.py）→
+    - 13+ 个 Q_* 质量信号（quality.py）→ 降级矩阵（capability.py）→
       把追加 flag / 降级 / 关闭落到每个 MetricValue（只降级不升级，
       censored/unavailable 语义优先）；
     - **B1 与 B2 物理隔离**：groups 为独立 dict（'A'/'B1'/'B2'/'D'），
@@ -18,6 +18,17 @@
       quality_signals.csv（含 threshold/passed）/ flag_glossary.csv /
       metrics_timeseries.csv（原生不规则时间戳 + dt_s）/ cache/quality.json /
       summary.json。
+
+T04 收口（本轮修复的历史并发写入分裂）：
+    - FLAG_GLOSSARY 只保留 capability.py 一份（4 列口径），本模块改为
+      导入并再导出，杜绝两份术语表；
+    - ManualSummary / 修正留痕读写一律委托 corrections.py，本模块不再
+      自带第二套 ManualSummary；
+    - quality_signals.csv 行生成统一走 quality.to_quality_rows（含 Q_glare
+      行与 threshold/passed 两列），删除本模块的重复实现；
+    - 新增 MetricsSummary（17 列冻结 schema 的表格容器，__init__ 导出）；
+    - 新增 build_baseline_stats（基线期统计唯一构造器；RP/归一化活跃度
+      的硬输入，基线不可得 → 返回 None，绝不造 0）。
 
 17 列 schema（docs/04 §6.3，空值 = 空字符串，绝不为 0）：
     metric_id, metric_name_zh, group, value, unit, unit_scale, status,
@@ -41,13 +52,24 @@ import numpy as np
 from src.core.config import RunConfig, Thresholds
 from src.core.frame_context import (
     BaselineStats,
+    FishDetections,
     FrameObservation,
     RunMeta,
     Tracks,
 )
 from src.core.metric_value import MetricValue
-from src.core.roi import ROI
-from src.metrics.capability import CapabilityReport, apply_capability
+from src.core.roi import ROI, point_in_polygon
+from src.metrics.capability import (
+    FLAG_GLOSSARY,
+    CapabilityReport,
+    apply_capability,
+)
+from src.metrics.corrections import (
+    ManualSummary,
+    apply_manual_counts,
+    load_corrections_jsonl,
+    summarize_corrections,
+)
 from src.metrics.group_a.clearance import clearance_metric, crossing_time
 from src.metrics.group_a.n0_estimator import estimate_n0
 from src.metrics.group_a.nonfeeding_loss import (
@@ -69,18 +91,21 @@ from src.metrics.group_b1.spatial_heterogeneity import (
     d_group_metrics,
 )
 from src.metrics.group_b2.zone_metrics import zone_metrics
-from src.metrics.quality import Q_KEYS, QualitySignals
+from src.metrics.quality import Q_KEYS, QualitySignals, to_quality_rows
 
 __all__ = [
     "MetricsAggregator",
     "Aggregator",
     "MetricsReport",
+    "MetricsSummary",
     "ManualSummary",
+    "build_baseline_stats",
     "compute_metrics_from_run_dir",
     "compute_run_metrics",
     "load_corrections",
     "write_run_outputs",
     "quality_rows",
+    "summary_row",
     "SUMMARY_COLUMNS",
     "METRIC_NAMES_ZH",
     "METRIC_GROUPS",
@@ -89,7 +114,7 @@ __all__ = [
 ]
 
 # ----------------------------------------------------------------------
-# 常量表（17 列 / 中文指标名 / 组归属 / flag 术语表）
+# 常量表（17 列 / 中文指标名 / 组归属）
 # ----------------------------------------------------------------------
 SUMMARY_COLUMNS: tuple[str, ...] = (
     "metric_id", "metric_name_zh", "group", "value", "unit", "unit_scale",
@@ -133,169 +158,23 @@ METRIC_GROUPS: dict[str, str] = {
     "D2_T_start": "D", "D3_T_end": "D", "D4_duration": "D",
 }
 
-MANUAL_SUFFIX = "_manual"
-
-# flag 术语表（docs/04 §6.1.2 ⑤：只看 CSV 的用户也在动线上能看到解释）
-# token -> (中文名, 含义, 建议动作)
-FLAG_GLOSSARY: dict[str, tuple[str, str, str]] = {
-    "contains_non_feeding_loss": (
-        "含非摄食损失",
-        "Q_pelletloss 超阈或沉性料：清空时间被沉降/漂出污染",
-        "与 A14 非摄食损失并列解读，勿单独当摄食速度使用",
-    ),
-    "denominator_suspect": (
-        "分母可疑",
-        "N₀ 检测值与投喂量口径偏差 > 20%",
-        "复核投喂量/单颗均重口径与早期密集帧漏检",
-    ),
-    "sedimentation_risk_unassessed": (
-        "沉降风险未评估",
-        "饲料类型未知：沉降损失未评估（未确认的元数据只加标记）",
-        "补填 pellet_type 元数据后重跑",
-    ),
-    "counting_unstable": (
-        "计数不稳定",
-        "N_p 非单调上升段占比 > 10%（回补/重入画/检测抖动）",
-        "速率类指标仅供定性；复核检测稳定性",
-    ),
-    "unstable_baseline": (
-        "基线不稳定",
-        "基线期变异系数 > 0.5，相对基线指标抖动大",
-        "延长基线段或改用绝对值口径",
-    ),
-    "low_conf": (
-        "低置信",
-        "依赖的检测/跟踪质量低于门限",
-        "结合 quality_signals.csv 的 Q_* 判定是否采信",
-    ),
-    "low_sensitivity": (
-        "灵敏度下降",
-        "烈度档 UNKNOWN/GENTLE 分支：活跃度类指标灵敏度可能不足",
-        "结合 FA 动态范围判断是否需要更敏感口径",
-    ),
-    "fish_count_confounded": (
-        "鱼数混淆",
-        "鱼体重叠使计数与因变量混淆，会伪造组间差异",
-        "改用 B1（帧差/异质性）做跨组比较",
-    ),
-    "censored": (
-        "右删失",
-        "事件在观察窗内未发生，仅知下界（> 窗长）",
-        "延长观察窗或改用 RR 残留率口径",
-    ),
-    "window_truncated": (
-        "观察窗截断",
-        "视频短于观察窗，改用实际窗长",
-        "跨 run 比较前核对 window_s 是否一致",
-    ),
-    "uncalibrated": (
-        "未归一化",
-        "基线缺失，只输出原始未归一化量",
-        "不可与已归一化的 run 直接比较",
-    ),
-    "unnormalized": (
-        "未标定口径",
-        "px 口径（无 px_per_mm），单次分析内可比较，跨视频不可",
-        "标定后重跑；跨 run 比较会被 compare 拦截",
-    ),
-    "fallback": (
-        "回退口径",
-        "主口径不可用，退化为备用口径并显式标注",
-        "解读时注意口径差异",
-    ),
-    "no_noise_correction": (
-        "未做噪声扣除",
-        "参考区缺失或 α 不可估计：户外波浪可能虚增活跃度",
-        "补充参考区定义或核对两组波浪条件",
-    ),
-    "no_denominator": (
-        "无分母",
-        "n_fish_total 缺失，只输出绝对值口径",
-        "补填总尾数后可算占比",
-    ),
-    "coarse": (
-        "粗分类",
-        "bottom_band 缺失，消失分类退化为两分",
-        "补充底部带定义以提高分类分辨率",
-    ),
-    "partial_window": (
-        "窗口部分覆盖",
-        "观察窗超出密集关联/采样窗口，后半程置信度低",
-        "重点采信密集窗口内的结论",
-    ),
-    "outdoor_exploratory": (
-        "仅探索性",
-        "户外斜拍机位下该组指标仅探索性使用",
-        "不得作为主结论依据",
-    ),
-    "manual_corrected": (
-        "人工修正口径",
-        "该指标由含人工修正帧的序列重算得到（原始值并列保留）",
-        "与不带后缀的原始口径对照解读",
-    ),
-    "must_pair_with_pelletloss": (
-        "必须与 A14 并列",
-        "T100 口径受沉降/漂出影响极大，不得单独对外",
-        "与 A14 非摄食损失率并列展示",
-    ),
+# inferentially_valid（docs/04 §6.1.4）：跨组统计推断可用性，正交于优先级。
+# 判据：门控是否中立（外部条件 → yes；依赖被测变量 → conditional；
+# 缺失具信息性 → no）。
+_INFERENTIALLY_VALID: dict[str, str] = {
+    "B1_frame_diff": "yes",            # 门控 Q_interf/Q_motion = 外部环境量
+    "B1_kurtosis_mean": "yes",
+    "B1_gini_mean": "yes",
+    "B1_top5_share_mean": "yes",
+    "B2-5_N_fz_mean": "conditional",   # 依赖鱼数计数（Q_overlap 非中立）
+    "B2-6_P_fz": "conditional",
+    "B2-7_RP": "conditional",
+    "D2_T_start": "conditional",       # 依赖基线（Q_baseline 外部，但判据含 FA）
+    "D3_T_end": "conditional",
+    "D4_duration": "conditional",
 }
 
-
-# ----------------------------------------------------------------------
-# 人工修正留档
-# ----------------------------------------------------------------------
-@dataclass
-class ManualSummary:
-    """人工修正程度留档（manual_summary 字段）。"""
-
-    n_corrected: int = 0                       # 修正帧数
-    n_total_frames: int = 0                    # 总观测帧数
-    frame_indices: list[int] = field(default_factory=list)
-    t_first_s: float | None = None
-    t_last_s: float | None = None
-    operators: list[str] = field(default_factory=list)
-
-    @property
-    def share(self) -> float | None:
-        """修正帧占比（分母为 0 → None，不猜测）。"""
-        if self.n_total_frames <= 0:
-            return None
-        return self.n_corrected / float(self.n_total_frames)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "n_corrected": self.n_corrected,
-            "n_total_frames": self.n_total_frames,
-            "frame_indices": list(self.frame_indices),
-            "t_first_s": self.t_first_s,
-            "t_last_s": self.t_last_s,
-            "operators": list(self.operators),
-            "share": self.share,
-        }
-
-
-def load_corrections(run_dir: str | Path) -> list[dict[str, Any]]:
-    """读取 corrections.jsonl（orchestrator.recompute_metrics 追加留痕）。
-
-    每行：{frame_idx, t_s, original_n, new_n, operator, note, timestamp}。
-    文件不存在 → 空列表（无修正 = 合法状态）。
-    """
-    path = Path(run_dir) / "corrections.jsonl"
-    if not path.exists():
-        return []
-    out: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "frame_idx" in rec and "new_n" in rec:
-                out.append(rec)
-    return out
+MANUAL_SUFFIX = "_manual"
 
 
 # ----------------------------------------------------------------------
@@ -345,47 +224,22 @@ class MetricsReport:
     # ------------------------------------------------------------------
     def summary_rows(self) -> list[dict[str, Any]]:
         """17 列冻结 schema 行（空值为空字符串，绝不为 0）。"""
-        spec = self.config.metrics_spec_version
-        rows: list[dict[str, Any]] = []
-        for mid in _metric_order(self.metrics):
-            mv = self.metrics[mid]
-            base_id = mid[: -len(MANUAL_SUFFIX)] if mid.endswith(MANUAL_SUFFIX) else mid
-            bf = mv.blocking_flags()
-            status = mv.status
-            bf_count: int | None
-            if status in ("unavailable", "censored"):
-                bf_count = None  # 空，绝不为 0（空值纪律）
-            else:
-                bf_count = len(bf)  # degraded 恒 ≥ 1（status:degraded 伪 flag）
-            n_used = (
-                mv.quality.get("n_frames_used")
-                if mv.quality.get("n_frames_used") is not None
-                else mv.quality.get("n_points")
+        return [
+            summary_row(mid, mv, self.config.metrics_spec_version)
+            for mid, mv in (
+                (m, self.metrics[m]) for m in _metric_order(self.metrics)
             )
-            rows.append(
-                {
-                    "metric_id": mid,
-                    "metric_name_zh": METRIC_NAMES_ZH.get(base_id, ""),
-                    "group": METRIC_GROUPS.get(base_id, _group_of(mid)),
-                    "value": _fmt_value(mv.value),
-                    "unit": mv.unit or "",
-                    "unit_scale": mv.unit_scale,
-                    "status": status,
-                    "reason": mv.reason or "",
-                    "flags": ";".join(mv.flags),
-                    "n_frames_used": _num_or_empty(n_used),
-                    "window_s": _num_or_empty(mv.quality.get("window_s")),
-                    "window_truncated": _bool_or_empty(
-                        mv.quality.get("window_truncated")
-                    ),
-                    "method": _method_of(mv),
-                    "inferentially_valid": "conditional",
-                    "blocking_flags": ";".join(bf),
-                    "blocking_flag_count": _num_or_empty(bf_count),
-                    "metrics_spec_version": spec,
-                }
-            )
-        return rows
+        ]
+
+    # ------------------------------------------------------------------
+    def to_summary(self) -> "MetricsSummary":
+        """17 列冻结表格容器（T05 UI / 导出层消费）。"""
+        return MetricsSummary(
+            run_id=self.run_id,
+            metrics_spec_version=self.config.metrics_spec_version,
+            columns=list(SUMMARY_COLUMNS),
+            rows=self.summary_rows(),
+        )
 
     # ------------------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -419,6 +273,198 @@ class MetricsReport:
             "warnings": list(self.warnings),
             "notes": list(self.notes),
         }
+
+
+@dataclass
+class MetricsSummary:
+    """17 列冻结 schema 的指标汇总表（docs/04 §6.1）。
+
+    为什么单独成类：metrics_summary.csv 是**跨 run 比较与统计的输入**，
+    必须有独立的、可序列化的表格载体（不能只藏在 MetricsReport 方法里）；
+    T05 的 compare / 导出 / UI 三处都要消费同一份行序与列序。
+
+    Attributes:
+        run_id: run 标识。
+        metrics_spec_version: 决定"什么叫干净"的清单版本（跨 run 必校项）。
+        columns: 17 列列名（冻结，顺序即 CSV 列序）。
+        rows: 行列表（每行为 17 键 dict；空值为空字符串，绝不为 0）。
+    """
+
+    run_id: str | None = None
+    metrics_spec_version: str = "ms-v1"
+    columns: list[str] = field(default_factory=lambda: list(SUMMARY_COLUMNS))
+    rows: list[dict[str, Any]] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_report(cls, report: "MetricsReport") -> "MetricsSummary":
+        """从 MetricsReport 构造（列序与行序唯一来源）。"""
+        return report.to_summary()
+
+    # ------------------------------------------------------------------
+    def metric_ids(self) -> list[str]:
+        """行序中的指标 ID 列表。"""
+        return [str(r.get("metric_id", "")) for r in self.rows]
+
+    def get(self, metric_id: str) -> dict[str, Any] | None:
+        """按 metric_id 取行（该 ID 未输出 → None，不造空行冒充）。"""
+        for r in self.rows:
+            if r.get("metric_id") == metric_id:
+                return r
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "metrics_spec_version": self.metrics_spec_version,
+            "columns": list(self.columns),
+            "rows": list(self.rows),
+        }
+
+
+def summary_row(
+    mid: str, mv: MetricValue, metrics_spec_version: str
+) -> dict[str, Any]:
+    """单个 MetricValue → 17 列冻结 schema 行（空值纪律的唯一实现）。
+
+    空值纪律（docs/04 §6.1.2 ③）：
+        - unavailable/censored → value 空、blocking_flag_count 空（绝不 0）；
+        - 无内容 → 空字符串，绝不写 "none"/"-"/"OK"。
+    """
+    base_id = mid[: -len(MANUAL_SUFFIX)] if mid.endswith(MANUAL_SUFFIX) else mid
+    bf = mv.blocking_flags()
+    status = mv.status
+    if status in ("unavailable", "censored"):
+        bf_count: int | None = None  # 空，绝不为 0（空值纪律）
+    else:
+        bf_count = len(bf)  # degraded 恒 ≥ 1（status:degraded 伪 flag）
+    n_used = (
+        mv.quality.get("n_frames_used")
+        if mv.quality.get("n_frames_used") is not None
+        else mv.quality.get("n_points")
+    )
+    return {
+        "metric_id": mid,
+        "metric_name_zh": METRIC_NAMES_ZH.get(base_id, ""),
+        "group": METRIC_GROUPS.get(base_id, _group_of(mid)),
+        "value": _fmt_value(mv.value),
+        "unit": mv.unit or "",
+        "unit_scale": mv.unit_scale,
+        "status": status,
+        "reason": mv.reason or "",
+        "flags": ";".join(mv.flags),
+        "n_frames_used": _num_or_empty(n_used),
+        "window_s": _num_or_empty(mv.quality.get("window_s")),
+        "window_truncated": _bool_or_empty(mv.quality.get("window_truncated")),
+        "method": _method_of(mv),
+        "inferentially_valid": _inferentially_valid(base_id, mv),
+        "blocking_flags": ";".join(bf),
+        "blocking_flag_count": _num_or_empty(bf_count),
+        "metrics_spec_version": metrics_spec_version,
+    }
+
+
+def _inferentially_valid(base_id: str, mv: MetricValue) -> str:
+    """跨组统计推断可用性（docs/04 §6.1.4）。
+
+    status 非 ok 的指标本身不可用于统计推断；A 组默认 conditional
+    （需 Q_n0gap 通过 + A14 校正），B1 帧差/异质性为 yes（门控中立）。
+    """
+    if mv.status != "ok" and mv.status != "degraded":
+        return "no"
+    return _INFERENTIALLY_VALID.get(base_id, "conditional")
+
+
+# ----------------------------------------------------------------------
+# 基线统计构造（RP / 归一化活跃度的硬输入）
+# ----------------------------------------------------------------------
+def build_baseline_stats(
+    observations: Sequence[FrameObservation],
+    roi: ROI | None = None,
+) -> BaselineStats | None:
+    """从基线期（t < 0）观测构造 BaselineStats（唯一构造器）。
+
+    docs/04 §1：基线期 = [t0 − baseline_window, t0)，最短 30 s；
+    基线缺失（帧数 < 2 或时长 < 30 s）→ 返回 **None**（BaselineStats
+    存在即代表 Q_baseline=True），绝不返回"看起来能用的"空壳统计。
+
+    Returns:
+        BaselineStats | None。None = 基线不可用（RP 与归一化活跃度随后
+        被强制关闭，绝对值口径保留）。
+    """
+    base_obs = [o for o in observations if o.t_s < -1e-9]
+    if len(base_obs) < 2:
+        return None
+    duration_s = float(max(o.t_s for o in base_obs) - min(o.t_s for o in base_obs))
+    if duration_s < 30.0:
+        return None
+
+    feed_zone = roi.feeding_zone if roi is not None else None
+    fish_counts: list[float] = []
+    n_fz_counts: list[float] = []
+    activity: list[float] = []
+
+    prev_gray: np.ndarray | None = None
+    prev_t: float | None = None
+    for obs in sorted(base_obs, key=lambda o: o.t_s):
+        fish = obs.extra.get("fish")
+        if isinstance(fish, FishDetections):
+            fish_counts.append(float(fish.n_det()))
+            if feed_zone is not None and fish.n_det() > 0:
+                cents = fish.centroids()
+                n_fz_counts.append(
+                    float(
+                        sum(
+                            1
+                            for c in cents
+                            if point_in_polygon(
+                                (float(c[0]), float(c[1])), feed_zone
+                            )
+                        )
+                    )
+                )
+        if obs.image is not None:
+            import cv2
+
+            gray = cv2.cvtColor(obs.image, cv2.COLOR_BGR2GRAY)
+            if prev_gray is not None and prev_t is not None:
+                dt = float(obs.t_s - prev_t)
+                if dt > 1e-9:
+                    activity.append(
+                        float(
+                            np.mean(
+                                np.abs(
+                                    gray.astype(np.float32)
+                                    - prev_gray.astype(np.float32)
+                                )
+                            )
+                        )
+                        / dt
+                    )
+            prev_gray, prev_t = gray, obs.t_s
+
+    def _mean(xs: list[float]) -> float:
+        return float(np.mean(xs)) if xs else 0.0
+
+    def _std(xs: list[float]) -> float:
+        return float(np.std(xs)) if len(xs) >= 2 else 0.0
+
+    annd_mean = _mean(n_fz_counts)  # 无个体级输入时的保守占位（见下 note）
+    return BaselineStats(
+        n_frames=len(base_obs),
+        duration_s=duration_s,
+        fish_count_mean=_mean(fish_counts),
+        fish_count_std=_std(fish_counts),
+        n_fz_mean=_mean(n_fz_counts),
+        n_fz_std=_std(n_fz_counts),
+        activity_mean=_mean(activity),
+        activity_std=_std(activity),
+        flow_mean=0.0,
+        flow_std=0.0,
+        annd_mean=annd_mean,
+        annd_std=0.0,
+        pellet_count_mean=0.0,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -641,7 +687,7 @@ def _compute_core(
 
 
 # ----------------------------------------------------------------------
-# B1 帧差标量（吸收自旧版聚合器：B1-1 主口径）
+# B1 帧差标量（B1-1 主口径）
 # ----------------------------------------------------------------------
 def _b1_frame_diff(activity: ActivityResult, signals: dict[str, Any]) -> MetricValue:
     """B1 帧差能量均值（试验窗；固定 arena 面积归一化 + 真实 dt 速率）。"""
@@ -831,7 +877,7 @@ class MetricsAggregator:
             auto_obs, th, meta, roi, baseline, px, link_result,
             window_s, truncated, video_duration_s, pellet_type,
         )
-        if not core.metrics["A1_N0"].status == "unavailable" and core.n0 is None:
+        if core.metrics["A1_N0"].status != "unavailable" and core.n0 is None:
             notes.append("N₀ 不可用：所有以 N₀ 为分母的指标已标 unavailable")
 
         # ---- 13 Q_*（quality.compute + A1/A14/A8-A10 注入）----
@@ -888,13 +934,13 @@ class MetricsAggregator:
                 "N₀ 双轨偏差超阈（可能漏检或口径不符），归一化颗粒指标"
                 "标记 denominator_suspect"
             )
-        if core.metrics.get("A8_T50") is not None and core.metrics["A8_T50"].status == "censored":
+        t50_mv = core.metrics.get("A8_T50")
+        if t50_mv is not None and t50_mv.status == "censored":
             warnings.append(
                 f"T50 右删失：>{window_s:.0f}s（输出下界，绝不为 0）"
             )
-        if core.metrics.get("A14_NonFeedingLoss") is not None and core.metrics[
-            "A14_NonFeedingLoss"
-        ].status == "unavailable":
+        a14_mv = core.metrics.get("A14_NonFeedingLoss")
+        if a14_mv is not None and a14_mv.status == "unavailable":
             notes.append(
                 "A14 不可用：任何清空时间类指标都不得声明已校正沉降损失"
             )
@@ -903,6 +949,7 @@ class MetricsAggregator:
                 "pellet_type 未确认：T 系列标记 sedimentation_risk_unassessed"
                 "（未确认元数据只加标记，不关闭）"
             )
+        warnings.extend(core.activity.warnings)
 
         # ---- 人工修正双轨（并列重算，不覆盖原值）----
         manual_groups: dict[str, dict[str, MetricValue]] | None = None
@@ -923,24 +970,26 @@ class MetricsAggregator:
                 )
                 g = METRIC_GROUPS.get(mid, _group_of(mid))
                 manual_groups.setdefault(g, {})[mid_m] = mv_m
-            manual_summary = ManualSummary(
-                n_corrected=len(corrected),
-                n_total_frames=len(obs_sorted),
-                frame_indices=[int(o.frame_idx) for o in corrected],
-                t_first_s=float(min(o.t_s for o in corrected)),
-                t_last_s=float(max(o.t_s for o in corrected)),
-                operators=sorted(
-                    {str(o.extra.get("manual_count_operator") or "user")
-                     for o in corrected}
-                ),
+            manual_summary = summarize_corrections(
+                obs_sorted,
+                [
+                    {
+                        "frame_idx": int(o.frame_idx),
+                        "t_s": float(o.t_s),
+                        "count": int(o.extra["manual_count"]),
+                        "operator": str(o.extra.get("manual_count_operator") or "user"),
+                    }
+                    for o in corrected
+                ],
+                source="corrections_jsonl",
             )
             for g, m in manual_groups.items():
                 for mid_m, mv_m in m.items():
                     metrics[mid_m] = mv_m
             notes.append(
-                f"人工修正 {len(corrected)} 帧（占 "
-                f"{manual_summary.share:.1%}）：_manual 口径与原始口径并列，"
-                "原始值不被覆盖"
+                f"人工修正 {manual_summary.corrected_frames} 帧（占 "
+                f"{manual_summary.corrected_fraction:.1%}）：_manual 口径与"
+                "原始口径并列，原始值不被覆盖"
             )
 
         return MetricsReport(
@@ -952,7 +1001,7 @@ class MetricsAggregator:
             manual_summary=manual_summary,
             timeseries=core.timeseries,
             quality_signals=signals,
-            quality_table=quality_rows(signals, th),
+            quality_table=to_quality_rows(signals, th),
             capability=capability,
             window_s=window_s,
             window_truncated=truncated,
@@ -962,8 +1011,13 @@ class MetricsAggregator:
 
 
 # ----------------------------------------------------------------------
-# 修正注入与剥离
+# 修正注入与剥离（统一委托 corrections.py）
 # ----------------------------------------------------------------------
+def load_corrections(run_dir: str | Path) -> list[dict[str, Any]]:
+    """读 run 目录下 corrections.jsonl（委托 corrections.load_corrections_jsonl）。"""
+    return load_corrections_jsonl(Path(run_dir) / "corrections.jsonl")
+
+
 def _strip_manual(
     observations: Sequence[FrameObservation],
 ) -> list[FrameObservation]:
@@ -985,26 +1039,12 @@ def apply_manual_corrections(
     observations: Sequence[FrameObservation],
     corrections: Sequence[dict[str, Any]],
 ) -> list[FrameObservation]:
-    """把 corrections.jsonl 记录注入观测副本（不修改输入序列）。
+    """把 corrections.jsonl 记录注入观测**副本**（不修改输入序列）。
 
-    Returns: 新的观测列表（对应帧 extra['manual_count'] = new_n）。
+    纪律（docs/06 §7.12）：任何人工修正只留痕、不静默；原始观测对象
+    不被就地改写，故返回新列表（inplace=False 委托 corrections 层）。
     """
-    by_new = {}
-    out: list[FrameObservation] = []
-    correction_by_idx = {int(c["frame_idx"]): int(c["new_n"]) for c in corrections}
-    operator_by_idx = {
-        int(c["frame_idx"]): str(c.get("operator") or "user") for c in corrections
-    }
-    for o in observations:
-        new_n = correction_by_idx.get(int(o.frame_idx))
-        if new_n is None:
-            out.append(o)
-            continue
-        extra = dict(o.extra)
-        extra["manual_count"] = new_n
-        extra["manual_count_operator"] = operator_by_idx[int(o.frame_idx)]
-        out.append(dataclasses.replace(o, extra=extra))
-    return out
+    return apply_manual_counts(observations, corrections, inplace=False)
 
 
 # ----------------------------------------------------------------------
@@ -1028,12 +1068,15 @@ def compute_run_metrics(
     obs_list = list(run_result.observations)
     corrections = load_corrections(run_result.run_dir)
     if corrections:
-        obs_list = apply_manual_corrections(obs_list, corrections)
+        obs_list = apply_manual_counts(obs_list, corrections, inplace=False)
 
     extra_quality: dict[str, Any] = {}
     qs = getattr(run_result, "quality_signals", None) or {}
     if qs.get("Q_dualtrack_gap_max") is not None:
         extra_quality["Q_dualtrack_gap"] = qs["Q_dualtrack_gap_max"]
+
+    if baseline is None:
+        baseline = build_baseline_stats(obs_list, roi)
 
     agg = MetricsAggregator(config=run_result.config)
     return agg.aggregate(
@@ -1091,13 +1134,14 @@ def compute_metrics_from_run_dir(
     if not run_dir.exists():
         raise FileNotFoundError(f"run 目录不存在: {run_dir}")
 
+    missing_cfg = False
     config: RunConfig
     cfg_path = run_dir / "run_config.yaml"
     if cfg_path.exists():
         config = RunConfig.from_yaml(cfg_path)
     else:
         config = RunConfig()
-        _warn = "run_config.yaml 缺失：使用内置默认配置（跨 run 比较将被 compare 拦截）"
+        missing_cfg = True
 
     observations = Orchestrator._read_cache(run_dir / "cache" / "detections.jsonl")
     if not observations:
@@ -1106,9 +1150,11 @@ def compute_metrics_from_run_dir(
         )
     corrections = load_corrections(run_dir)
     if corrections:
-        observations = apply_manual_corrections(observations, corrections)
+        observations = apply_manual_counts(observations, corrections, inplace=False)
     if meta is None:
         meta = _meta_from_json(run_dir / "meta.json")
+    if baseline is None:
+        baseline = build_baseline_stats(observations, roi)
 
     agg = MetricsAggregator(config=config)
     report = agg.aggregate(
@@ -1122,8 +1168,11 @@ def compute_metrics_from_run_dir(
         outdoor=outdoor,
         run_id=run_dir.name,
     )
-    if not cfg_path.exists():
-        report.warnings.append(_warn)
+    if missing_cfg:
+        report.warnings.append(
+            "run_config.yaml 缺失：使用内置默认配置"
+            "（跨 run 比较将被 compare 拦截）"
+        )
     if corrections:
         report.notes.append(
             f"从 corrections.jsonl 注入 {len(corrections)} 条人工修正（双轨重算）"
@@ -1132,58 +1181,17 @@ def compute_metrics_from_run_dir(
 
 
 # ----------------------------------------------------------------------
-# quality_signals.csv 行
+# quality_signals.csv 行（统一委托 quality.to_quality_rows）
 # ----------------------------------------------------------------------
-_Q_THRESHOLD_RULES: dict[str, tuple[str, str]] = {
-    # key → (thresholds 字段名, 方向)：'ge' = value ≥ threshold 通过，
-    # 'le' = value ≤ threshold 通过；布尔/无阈值的信号走显式分支。
-    "Q_det": ("q_det_min", "ge"),
-    "Q_fdet": ("q_det_min", "ge"),
-    "Q_track": ("q_track_min", "ge"),
-    "Q_interf": ("q_interf_max", "le"),
-    "Q_fg": ("q_fg_min", "ge"),
-    "Q_pelletloss": ("pelletloss_degrade", "le"),
-    "Q_n0gap": ("n0_gap_warn", "le"),
-}
-
-
 def quality_rows(
-    signals: dict[str, Any], thresholds: Thresholds
+    signals: dict[str, Any], thresholds: Thresholds | None = None
 ) -> list[dict[str, Any]]:
-    """quality_signals.csv 行（signal / value / threshold / passed）。
+    """quality_signals.csv 行（signal/value/threshold/passed，含 Q_glare 行）。
 
-    纪律：未测得（None）→ value 空且 passed 空（None ≠ False，绝不冒充）。
+    T04 收口：本函数改为 quality.to_quality_rows 的别名（此前两份实现
+    口径不同：本模块的旧实现漏了 Q_glare 行与 Q_interf 的方向判定）。
     """
-    rows: list[dict[str, Any]] = []
-    for key in Q_KEYS:
-        val = signals.get(key)
-        rule = _Q_THRESHOLD_RULES.get(key)
-        if rule is not None:
-            attr, direction = rule
-            thr = getattr(thresholds, attr, None)
-            if val is None or thr is None:
-                passed: bool | None = None
-            elif direction == "ge":
-                passed = bool(float(val) >= float(thr))
-            else:
-                passed = bool(float(val) <= float(thr))
-            rows.append(
-                {
-                    "signal": key,
-                    "value": val,
-                    "threshold": thr,
-                    "passed": passed,
-                }
-            )
-        elif isinstance(val, bool):
-            rows.append(
-                {"signal": key, "value": val, "threshold": None, "passed": val}
-            )
-        else:
-            rows.append(
-                {"signal": key, "value": val, "threshold": None, "passed": None}
-            )
-    return rows
+    return to_quality_rows(signals, thresholds)
 
 
 # ----------------------------------------------------------------------

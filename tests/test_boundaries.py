@@ -222,7 +222,8 @@ class TestUnavailableHasReason:
         )
         obs = make_obs(0.0, 10)
         obs.extra["fish"] = fish
-        out, _ = zone_metrics(obs, roi, RunMeta(n_fish_total=10), None, {})
+        # zone_metrics 消费观测**序列**（内部按 t_s 排序），单帧须包成列表
+        out, _ = zone_metrics([obs], roi, RunMeta(n_fish_total=10), None, {})
         mv = out["B2-7_RP"]
         assert mv.status == "unavailable"
         assert mv.value is None
@@ -310,7 +311,7 @@ class TestOverridesLeaveTrace:
         obs.extra["fish"] = fish
         # CV = 1.5/2.0 = 0.75 > 0.5
         out, _ = zone_metrics(
-            obs, roi, RunMeta(n_fish_total=10),
+            [obs], roi, RunMeta(n_fish_total=10),
             baseline(n_fz_mean=2.0, n_fz_std=1.5), {},
         )
         assert "unstable_baseline" in out["B2-7_RP"].flags

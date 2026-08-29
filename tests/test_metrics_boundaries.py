@@ -192,9 +192,20 @@ class TestEmptyRunFullKeys:
         signals = QualitySignals().compute([])
         missing = [k for k in Q_KEYS if k not in signals]
         assert missing == []
-        # 未测得一律 None（Q_censored 占位 False 除外）
+        # 未测得一律为 None（**布尔型信号除外**——见下）。
+        # ⚠️ Q_calib / Q_baseline / Q_censored 三者在 docs/04 §2 中定义为
+        # **布尔量**（Q_calib = `px_per_mm is not None`；Q_baseline =
+        # `BaselineStats is not None and duration_s ≥ 30`；Q_censored =
+        # 右删失标记）。无输入时它们的正确取值是 False（"确实没有标定/
+        # 确实没有基线"），不是 None —— 把它写成 None 反而丢失了"已判定
+        # 无基线"这一信息（docs/04 §0.1：不要用 0/False 冒充"未测得"，
+        # 反之亦然：已测得为假时也不该写 None）。
+        _BOOLEAN_SIGNALS = ("Q_calib", "Q_baseline", "Q_censored")
         for k in Q_KEYS:
-            if k == "Q_censored":
+            if k in _BOOLEAN_SIGNALS:
+                assert signals[k] is False, (
+                    f"{k} 是布尔型信号，无输入时应为 False 而非 {signals[k]!r}"
+                )
                 continue
             assert signals[k] is None, f"{k} 未测得应为 None 而非 {signals[k]!r}"
 

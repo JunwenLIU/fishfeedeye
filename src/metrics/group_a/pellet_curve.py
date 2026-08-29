@@ -34,7 +34,6 @@ __all__ = [
     "rebound_fraction",
 ]
 
-
 @dataclass
 class TimeSeries:
     """通用指标时序（A2/A3/A5/D1/B1 曲线的统一载体，非 MetricValue 标量轨）。
@@ -233,18 +232,58 @@ def moving_median(x: np.ndarray, w: int = 3) -> np.ndarray:
     return out
 
 
+def _smooth_segments(t: np.ndarray, valid: np.ndarray) -> list[np.ndarray]:
+    """切出「有效且同相位」的连续段（返回索引数组列表）。
+
+    为什么必须分段（docs/04 §3.1 A2 + §1 时间基准约定）：
+        t0 处存在**真实阶跃**——基线期（t < 0，投喂前）颗粒数恒为 0，
+        试验期起始为 N₀。若对整条时间轴一把平滑，投喂前的零值会被卷进
+        早期试验窗的滑动窗口，**系统性压低 N₀、T50 与 v_max 的估计**
+        ——而早期窗口恰恰是 A1/A6/A8 主结论所在。
+
+    分段条件：有效点（~low_conf）且相邻索引在 **同一相位**（同属基线期
+    或同属试验期）且索引连续。
+    """
+    t = np.asarray(t, dtype=float)
+    valid = np.asarray(valid, dtype=bool)
+    segments: list[list[int]] = []
+    current: list[int] = []
+    prev_idx: int | None = None
+    prev_phase: bool | None = None
+    for i in range(t.shape[0]):
+        if not bool(valid[i]):
+            prev_idx = None
+            prev_phase = None
+            continue
+        phase = bool(t[i] >= 0.0)
+        contiguous = (
+            prev_idx is not None
+            and i == prev_idx + 1
+            and prev_phase is not None
+            and phase == prev_phase
+        )
+        if current and not contiguous:
+            segments.append(current)
+            current = []
+        current.append(i)
+        prev_idx, prev_phase = i, phase
+    if current:
+        segments.append(current)
+    return [np.asarray(seg, dtype=int) for seg in segments]
+
+
 def smooth_series(series: PelletSeries, w: int | None = None) -> PelletSeries:
     """对 n 做移动中位数平滑（A2 契约：平滑窗口默认 5 采样点）。
 
     low_conf 帧不参与平滑（其原值保留并继续标记不可信）。
+    **分段平滑**：基线期与试验期之间不跨 t0 混合（见 _smooth_segments）。
     """
     w_use = 5 if w is None else int(w)
     n = series.n.copy()
     if series.available and n.size > 0:
-        ok = ~series.low_conf
-        if np.any(ok):
-            smoothed = moving_median(n[ok], w_use)
-            n[ok] = smoothed
+        for seg in _smooth_segments(series.t, ~series.low_conf):
+            if seg.size:
+                n[seg] = moving_median(n[seg], w_use)
     return PelletSeries(
         t=series.t, n=n, conf_med=series.conf_med, low_conf=series.low_conf,
         frame_idx=series.frame_idx, source=series.source,

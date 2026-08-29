@@ -156,14 +156,28 @@ def load_corrections_jsonl(path: str | Path) -> list[dict[str, Any]]:
 def apply_manual_counts(
     observations: Sequence[FrameObservation],
     records: Sequence[dict[str, Any]],
-) -> int:
+    inplace: bool = True,
+) -> list[FrameObservation]:
     """把修正记录写入 obs.extra['manual_count']（唯一数据通路）。
 
+    Args:
+        observations: 观测序列。
+        records: 修正记录（frame_idx + count/new_n/manual_count/n 之一）。
+        inplace: True（默认）= 就地写入 obs.extra（历史口径，orchestrator
+            与标注工具依赖）；False = 返回**副本**列表，原观测对象不被
+            改写（aggregator 双轨需要同时保留自动轨与修正轨时使用）。
+
     Returns:
-        实际命中的帧数（记录帧号不在观测中 → 跳过并计 0 命中）。
+        inplace=True → 观测序列本身（便于链式调用）与实际命中帧数由
+            summarize_corrections 统计；inplace=False → 新的观测列表。
     """
-    by_idx = {obs.frame_idx: obs for obs in observations}
-    n_applied = 0
+    import dataclasses
+
+    target: list[FrameObservation] = (
+        list(observations) if inplace
+        else [dataclasses.replace(o, extra=dict(o.extra)) for o in observations]
+    )
+    by_idx = {obs.frame_idx: obs for obs in target}
     for rec in records:
         obs = by_idx.get(int(rec["frame_idx"]))
         if obs is None:
@@ -174,8 +188,7 @@ def apply_manual_counts(
         obs.extra["manual_count"] = int(count)
         if rec.get("operator"):
             obs.extra["manual_count_operator"] = str(rec["operator"])
-        n_applied += 1
-    return n_applied
+    return target
 
 
 def summarize_corrections(

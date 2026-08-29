@@ -40,62 +40,166 @@ INFORMATIVE_MISSINGNESS_HINT = (
     "跨组统计推断请改用 B1-1/2/3（帧差能量/光流/频谱，门控中立）"
 )
 
-# flag 术语表（B 类边界测试 B8：所有对外输出的 flag 必须可在此查到释义；
-# 含 8 项阻断 flag、status 伪 flag 与常用非阻断 flag）。
-FLAG_GLOSSARY: dict[str, str] = {
-    # ---- 阻断清单（docs/04 §6.1.2 ①）----
+# ======================================================================
+# flag 术语表（★ 全局唯一权威份；T04 收口删除了 aggregator 里的第二份）
+# ----------------------------------------------------------------------
+# B 类边界测试 B8：所有对外输出的 flag 必须可在此查到释义。
+# 格式：token -> (中文名, 含义, 建议动作)
+#   —— 三元组直接对应 docs/04 §6.1.2 ⑤ 要求的 flag_glossary.csv 四列
+#      （flag_token / 中文名 / 含义 / 建议动作），由 write_run_outputs 落盘。
+# 覆盖范围：8 项阻断 flag + 4 个 status 伪 flag + 全部非阻断 flag +
+#           矛盾三段式 flag（docs/04 §4.5）。
+# ======================================================================
+FLAG_GLOSSARY: dict[str, tuple[str, str, str]] = {
+    # ---- ① 阻断清单（docs/04 §6.1.2 ①，8 项）----
     "contains_non_feeding_loss": (
-        "指标值混入非摄食损失成分（Q_pelletloss > 15% 或沉性料）："
-        "须与 A14 并列展示，不可单独作为摄食结论"
+        "含非摄食损失",
+        "Q_pelletloss > 15% 或沉性料：清空时间/残留率混入沉降与漂出成分，"
+        "沉降与摄食不可分",
+        "必须与 A14 非摄食损失率并列展示，不可单独作为摄食速度结论",
     ),
     "denominator_suspect": (
-        "N₀ 分母可疑（Q_n0gap > 20%）：以 N₀ 为分母的指标系统性偏差风险"
+        "分母可疑",
+        "N₀ 检测值与投喂量口径偏差 > 20%（Q_n0gap 超阈）：以 N₀ 为分母的"
+        "指标存在系统性偏差风险",
+        "复核投喂量/单颗均重口径与早期密集帧漏检；勿跨组比较该指标",
     ),
     "sedimentation_risk_unassessed": (
-        "pellet_type 未确认：沉降与摄食不可分的风险未评估（保守标记，不关闭）"
+        "沉降风险未评估",
+        "pellet_type 未确认（UNKNOWN）：沉降与摄食不可分的风险未评估",
+        "补填 pellet_type 元数据后重跑（未确认元数据只加标记，不关闭）",
     ),
     "counting_unstable": (
-        "N_p 曲线非单调上升段占比 > 10%：计数回补噪声显著，速率类仅供定性"
+        "计数不稳定",
+        "N_p 曲线非单调上升段占比 > 10%：计数回补噪声显著",
+        "速率类指标（A5/A6/A7）仅供定性；复核检测稳定性",
     ),
-    "unstable_baseline": "基线期变异系数 > 0.5：相对基线指标不稳定",
-    "low_conf": "依赖的检测/跟踪质量低于门限",
-    "degenerate": "几何退化（如 FIFFB 质心重复率超阈值）",
+    "unstable_baseline": (
+        "基线不稳定",
+        "基线期变异系数 > 0.5：相对基线指标抖动大",
+        "延长基线段或改用绝对值口径",
+    ),
+    "low_conf": (
+        "低置信",
+        "该指标依赖的检测/跟踪质量低于门限",
+        "结合 quality_signals.csv 的 Q_* 判定是否采信",
+    ),
+    "degenerate": (
+        "几何退化",
+        "几何已破坏（如 FIFFB 质心重复率超阈值），数值无意义",
+        "复核检测器是否把多条鱼检成同一点；改用其它聚集度指标",
+    ),
     "fish_count_confounded": (
-        "Q_overlap 超阈值：鱼数与因变量存在混淆（视场内计数不可信）"
+        "鱼数混淆",
+        "Q_overlap 超阈值：鱼体重叠使计数与因变量混淆，会伪造组间差异",
+        "改用 B1-1/2/3（帧差能量/光流幅值/傅里叶频谱）做跨组比较",
     ),
-    # ---- status 伪 flag（blocking_flags() 追加项）----
-    "status:ok": "指标状态正常（伪 flag，用于 blocking_flags 单列筛选）",
-    "status:degraded": "指标已降级为参考值（伪 flag）",
-    "status:unavailable": "指标不可用（伪 flag；对应 value 必为 None）",
-    "status:censored": "指标右删失（伪 flag；输出 '>窗长'）",
-    # ---- 常用非阻断 flag ----
-    "censored": "右删失：观察窗内未达阈值，输出 '>窗长' 而非数值",
+    # ---- ② status 伪 flag（blocking_flags() 追加项）----
+    "status:ok": (
+        "状态正常",
+        "指标状态正常（伪 flag，用于 blocking_flags 单列筛选）",
+        "无需处理",
+    ),
+    "status:degraded": (
+        "状态已降级",
+        "指标已降级为参考值（伪 flag；非 ok 时 blocking_flags 恒含此项）",
+        "按 reason 与 flags 判定是否可用于结论",
+    ),
+    "status:unavailable": (
+        "状态不可用",
+        "指标不可用（伪 flag；对应 value 必为 None，绝不为 0）",
+        "读 reason 了解缺失原因；跨组比较时注意可能是非随机缺失",
+    ),
+    "status:censored": (
+        "状态右删失",
+        "指标右删失（伪 flag；输出 '>窗长' 而非数值）",
+        "延长观察窗或改用 RR 残留率口径",
+    ),
+    # ---- ③ 常用非阻断 flag ----
+    "censored": (
+        "右删失",
+        "事件在观察窗内未发生，仅知下界（> 窗长），绝不输出 0/NaN",
+        "延长观察窗或改用 RR 残留率口径",
+    ),
     "partial_window": (
-        "观察窗长于密集关联窗口（a14_window_s）：消失分类仅部分可信"
+        "窗口部分覆盖",
+        "观察窗长于密集关联/采样窗口（a14_window_s）：后半程消失分类仅部分可信",
+        "重点采信密集窗口内的结论",
     ),
-    "coarse": "bottom_band 未定义：消失三分类退化为两分",
+    "coarse": (
+        "粗分类",
+        "bottom_band 未定义：消失三分类退化为「边界 vs 邻域鱼」两分",
+        "补充底部带定义以提高分类分辨率",
+    ),
     "low_sensitivity": (
-        "烈度档 UNKNOWN/GENTLE 保守分支：该指标判据灵敏度不足（仅标记，不关闭）"
+        "灵敏度下降",
+        "烈度档 UNKNOWN/GENTLE 保守分支：该指标判据灵敏度可能不足"
+        "（自动判据只标记，不关闭任何指标，docs/04 §4.0）",
+        "结合 FA 动态范围判断是否需要更敏感口径",
     ),
-    "uncalibrated": "基线缺失：只输出未归一化绝对量，不可跨视频比较",
+    "uncalibrated": (
+        "未归一化",
+        "基线缺失（Q_baseline=False）：只输出原始未归一化绝对量",
+        "不可与已归一化的 run 直接比较",
+    ),
     "no_noise_correction": (
-        "未做参考区噪声扣除：户外波浪可能虚增活跃度"
+        "未做噪声扣除",
+        "参考区缺失或 α 不可估计：户外波浪可能虚增活跃度",
+        "补充参考区定义或核对两组波浪条件是否一致",
     ),
-    "no_denominator": "分母缺失（如 n_fish_total 未提供）：只输出绝对值",
-    "outdoor_exploratory": "户外斜拍场景：探索性输出，不进入主结论",
-    "fallback": "主判据不可用，退回次级口径（如 FA→颗粒下降）",
-    "window_truncated": "视频短于标称观察窗：窗口截断口径",
-    "unnormalized": "未标定：mm 量纲降级为 px（单次分析内可用）",
-    "window_fallback": "T50 删失导致搜索窗口退化（[t0, 0.5×窗长]）",
-    # ---- 矛盾三段式（docs/04 §4.5）----
+    "no_denominator": (
+        "无分母",
+        "分母缺失（如 n_fish_total 未提供）：只输出绝对值口径",
+        "补填总尾数后可算占比",
+    ),
+    "outdoor_exploratory": (
+        "仅探索性",
+        "户外斜拍机位下该组指标仅探索性使用（B2/C 组默认降级）",
+        "不得作为主结论依据；主结论建立在 A 组颗粒曲线上",
+    ),
+    "fallback": (
+        "回退口径",
+        "主判据不可用，已退回次级口径并显式标注（如 FA 判据 → 颗粒首次下降）",
+        "解读时注意与主口径的差异，勿与 fallback=False 的 run 直接比较",
+    ),
+    "window_truncated": (
+        "观察窗截断",
+        "视频短于标称观察窗（observation_window_s），改用实际窗长",
+        "跨 run 比较前核对 window_s 是否一致（compare 规则 4）",
+    ),
+    "unnormalized": (
+        "未标定口径",
+        "px 口径（无 px_per_mm）：单次分析内可比较，跨视频不可比较",
+        "标定后重跑；跨 run 比较时会被 compare 规则 1 拦截",
+    ),
+    "window_fallback": (
+        "搜索窗回退",
+        "T50 右删失导致 v_max 搜索窗口退化为 [t0, 0.5×窗长]",
+        "该 v_max 为早期窗口口径，勿与 T50 口径的 run 直接比较",
+    ),
+    "must_pair_with_pelletloss": (
+        "必须与 A14 并列",
+        "T100 口径受沉降/漂出影响极大，任何时候都不得单独对外",
+        "与 A14 非摄食损失率并列展示",
+    ),
+    "manual_corrected": (
+        "人工修正口径",
+        "该指标由含人工修正帧的序列重算得到（原始口径并列保留，不被覆盖）",
+        "与不带 _manual 后缀的原始口径对照解读",
+    ),
+    # ---- ④ 矛盾三段式（docs/04 §4.5）----
     "metadata_contradiction": (
+        "元数据与实测矛盾",
         "用户元数据与实测信号矛盾（如声明浮性料但 Q_pelletloss 超阈）："
-        "以实测口径为准，须人工复核投喂记录"
+        "A14 可用，已按实测口径处理",
+        "若确认饲料为浮性，请检查 ROI.bottom_band 是否覆盖了排水口/溢流区",
     ),
     "sedimentation_risk_unverifiable": (
-        "Q_pelletloss 不可测（A14 未关联）：沉降风险无法验证，"
+        "沉降风险无法验证",
+        "Q_pelletloss 不可测（A14 不可用）：沉降风险无法验证，"
         "不覆盖用户声明（与 sedimentation_risk_unassessed 的区别："
-        "前者是元数据缺项，本 flag 是实测通道缺失）"
+        "前者是元数据缺项，本 flag 是实测通道缺失）",
+        "补一段无鱼纯饲料标定视频以建立 A14 关联，再复核沉降损失",
     ),
 }
 
@@ -300,9 +404,13 @@ def apply_capability(
                 "不覆盖用户声明，请结合无鱼纯饲料视频复核"
             )
 
-    # ---- ④ 无基线 → 相对指标关闭，绝对值口径保留 ----
+    # ---- ④ 基线 → 相对指标关闭，绝对值口径保留 ----
+    # ⚠️ 三态区分（与 Q_track / Q_pelletloss / Q_n0gap 的口径一致）：
+    #   False = 实测判定为「无可用基线」→ Q_* 实测信号，有权关闭 RP；
+    #   None  = 未测得（BaselineStats 未构造/未传入）→ **无权关闭**，
+    #           只能追加 ⚠️ 标记（docs/04 §4.0 元规则；未测得 ≠ 测得为假）。
     q_baseline = q.get("Q_baseline")
-    if q_baseline is not True:
+    if q_baseline is False:
         _close(
             "B2-7_RP",
             reason="Q_baseline = False：RP 相对基线指标强制关闭"
@@ -314,6 +422,17 @@ def apply_capability(
                 mid,
                 "基线缺失：只输出未归一化绝对量（uncalibrated=True）",
             )
+        report.notes.append(
+            "Q_baseline = False（实测）：RP 强制关闭，"
+            "B1 只输出未归一化量（uncalibrated）"
+        )
+    elif q_baseline is None:
+        for mid in ("B1_frame_diff", "B1_spatial_heterogeneity"):
+            _flag(mid, "uncalibrated")
+        report.notes.append(
+            "Q_baseline 未测得（None）：只追加 uncalibrated 标记，"
+            "不关闭任何指标（未测得 ≠ 测得为假，docs/04 §4.0 元规则）"
+        )
 
     # ---- ⑤ mm 量纲缺标定 → 降像素量纲（team-lead 派单三规则之一）----
     q_calib = q.get("Q_calib")

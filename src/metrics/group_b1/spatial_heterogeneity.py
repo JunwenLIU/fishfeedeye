@@ -327,6 +327,16 @@ def d_group_metrics(
                 metric_id=mid, value=None, unit="s", status="unavailable",
                 reason=reason, quality=dict(quality),
             )
+        # D4 的 unavailable 必须显式声明"不得用窗长代替"（B 类边界测试：
+        # 无论走哪个分支，持续时长都不得拿观察窗冒充）。
+        out["D4_duration"] = MetricValue(
+            metric_id="D4_duration", value=None, unit="s", status="unavailable",
+            reason=(
+                f"{reason}；D2/D3 任一删失，持续时长不可计算"
+                "（契约禁止用窗长代替——不得输出 0 或观察窗长冒充持续时长）"
+            ),
+            quality=dict(quality, window_s=window_s),
+        )
         return out
 
     t_fa, v_fa = fa.valid_t_values()
@@ -410,6 +420,6 @@ def d_group_metrics(
     else:
         out["D4_duration"] = MetricValue(
             metric_id="D4_duration", value=float(t_end) - float(t_start), unit="s",
-            status="ok", quality=dict(quality, window_s=window_s),
+            status="ok", reason=None, quality=dict(quality, window_s=window_s),
         )
     return out

@@ -61,7 +61,11 @@ def render_water_frame(
     # 缓变波浪（相位随时间漂移，制造真实帧差但保持暗色）
     wave = wave_amplitude * np.sin(xx / 18.0 + t_s * 1.3) * np.cos(yy / 24.0 - t_s * 0.7)
     frame = base[None, None, :] + wave[:, :, None]
-    rng = np.random.default_rng(seed + int(t_s * 1000))
+    # 噪声种子：必须支持**负时刻**（基线期 t < 0 是合法且常见的输入），
+    # 故做非负映射（seed 与时刻双因子，避免 t 与 -t 共种子）。
+    rng = np.random.default_rng(
+        int(seed) * 1_000_003 + int(round(t_s * 1000.0)) + 1_000_000
+    )
     frame += rng.integers(-8, 9, (h, w, 1))  # 帧内噪声（去相关由种子 t 变化）
     frame = np.clip(frame, 0, 255).astype(np.uint8)
 

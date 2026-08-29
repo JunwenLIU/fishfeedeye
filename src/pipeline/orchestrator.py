@@ -113,6 +113,7 @@ class Orchestrator:
         linker: PelletLinker | None = None,
         run_dir: str | Path | None = None,
         progress: ProgressFn | None = None,
+        keep_images: bool = False,
     ) -> RunResult:
         """执行主分析管线（流程一）。
 
@@ -125,6 +126,11 @@ class Orchestrator:
             detectors: 检测器列表（双轨）；None/空 = 不检测。
             linker: 颗粒关联器；None = 不关联。
             run_dir: 既有 run 目录（续跑）；None = 新建 run。
+            keep_images: 检测完成后是否**保留**解码帧（B1 帧差活跃度与
+                D 组起止时刻需要连续帧图像）。默认 False——检测完即释放，
+                防内存膨胀（1080p × 114 帧 ≈ 700 MB）。开启时指标层才能
+                产出 B1/D 组；不开启时这两组按契约输出 unavailable +
+                reason（不静默缺省、不用 0 冒充）。
         """
         if progress is None:
             progress = lambda _s, _f: None  # noqa: E731
@@ -173,7 +179,8 @@ class Orchestrator:
                     continue
                 self._detect_frame(obs, detectors, roi)
                 n_processed += 1
-                obs.image = None  # 检测完成即释放，防内存膨胀
+                if not keep_images:
+                    obs.image = None  # 检测完成即释放，防内存膨胀
                 progress("detect", 0.5 + 0.4 * (k + 1) / len(ing.observations))
             # 续跑：恢复已缓存帧的检测结果
             if done_frames:
@@ -188,8 +195,19 @@ class Orchestrator:
             )
         else:
             for obs in ing.observations:
-                obs.image = None
+                if not keep_images:
+                    obs.image = None
             notes.append("未配置检测器：仅执行 ingest→preprocess（采样帧清单见 sampling_table）")
+        if keep_images:
+            notes.append(
+                "keep_images=True：保留采样帧图像（B1 帧差活跃度与 D 组起止"
+                "可算；内存随采样帧数 × 分辨率线性增长）"
+            )
+        else:
+            notes.append(
+                "keep_images=False：采样帧图像已释放，B1 帧差活跃度与 D 组"
+                "起止时刻按契约输出 unavailable + reason（不用 0 冒充）"
+            )
 
         # ---- 关联 ----
         link_result: LinkResult | None = None

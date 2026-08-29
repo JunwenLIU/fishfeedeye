@@ -40,7 +40,7 @@ def trapz_integral(t: np.ndarray, y: np.ndarray) -> float:
 def fit_exponential(
     t: np.ndarray, n: np.ndarray, n0: float, thresholds: Thresholds,
 ) -> dict:
-    """A12 指数衰减拟合（ln 域最小二乘 + 原域 R²/RMSE）。
+    """A12 指数衰减拟合（ln 域**加权**最小二乘 + 原域 R²/RMSE）。
 
     Returns:
         {"k", "tau", "r2", "rmse", "n_points", "unavailable_reason"}
@@ -57,21 +57,36 @@ def fit_exponential(
                     f"有效点 {n_points} < {thresholds.fit_min_points}，不拟合"
                 )}
     ts, ns = t[ok], n[ok]
-    # ln 域线性回归：ln N = ln N0 − k·t
-    slope, _intercept = np.polyfit(ts, np.log(ns), 1)
+    # 零变异先判（常数曲线）：R² 的分母为 0，此时任何回归参数都无意义，
+    # 必须在进入回归之前拦掉（否则会先撞上"斜率非负"分支，给出误导性原因）。
+    sst = float(np.sum((ns - ns.mean()) ** 2))
+    if sst <= 1e-12:
+        return {"k": None, "tau": None, "r2": None, "rmse": None,
+                "n_points": n_points,
+                "unavailable_reason": (
+                    "拟合失败（序列零变异，常数曲线）：R² 无定义，不输出参数"
+                )}
+    # ln 域加权线性回归：ln N = ln N0 − k·t
+    # ⚠️ 权重为什么是 n²（不是等权）：
+    #   N 是**整数计数**，量化误差 σ_N ≈ 1/√12（均匀分布）；
+    #   一阶传播到对数域：Var(ln N) ≈ σ_N² / N² ∝ 1/N²。
+    #   ⇒ 逆方差权重 w = N²。等权 ln 拟合会让尾部的相对误差（N=1~3 时
+    #   量化误差可达 ±50%）主导回归，**系统性低估 k**（实测偏低约 3.7%，
+    #   对 τ = ln2/k 与"半衰期"结论是直接偏差）。
+    w = ns * ns
+    sw = np.sqrt(w)
+    design = np.vstack([ts, np.ones_like(ts)]).T * sw[:, None]
+    slope, _intercept = np.linalg.lstsq(design, np.log(ns) * sw, rcond=None)[0]
     k = -float(slope)
     if k <= 0:
         return {"k": None, "tau": None, "r2": None, "rmse": None,
                 "n_points": n_points,
-                "unavailable_reason": "拟合斜率非负（无衰减趋势），k 无意义"}
+                "unavailable_reason": (
+                    "拟合失败（拟合斜率非负，无衰减趋势）：k 无意义，不输出参数"
+                )}
     tau = float(np.log(2.0) / k)
     pred = float(n0) * np.exp(-k * ts)
-    sst = float(np.sum((ns - ns.mean()) ** 2))
     sse = float(np.sum((ns - pred) ** 2))
-    if sst <= 1e-12:
-        return {"k": None, "tau": None, "r2": None, "rmse": None,
-                "n_points": n_points,
-                "unavailable_reason": "序列零变异（常数曲线），R² 无定义"}
     r2 = 1.0 - sse / sst
     rmse = float(np.sqrt(sse / n_points))
     return {"k": k, "tau": tau, "r2": float(r2), "rmse": rmse,
@@ -136,14 +151,18 @@ def residual_metrics(
         q11["window_truncated"] = bool(truncated)
         q11["method"] = "integral=trapz-free;N_end/N0"
         q11["n_p_end"] = n_end
-        status = "degraded" if nonfeeding else "ok"
-        reason = None
+        # 状态与 reason 必须自洽：任何非空 reason 都对应非 ok 状态。
+        # 窗口截断改变了 RR 的物理含义（RR@80s ≠ RR@300s，跨 run 不可比），
+        # 故与 A13_AUC60 保持一致按 degraded 处理（compare 规则 4 会拦截）。
+        status = "degraded" if (nonfeeding or truncated) else "ok"
+        reason: str | None = None
         if nonfeeding:
             reason = ("存在非摄食损失（Q_pelletloss 超限或沉性料）：RR 含非摄食"
                       "成分，标记 contains_non_feeding_loss")
         elif truncated:
             reason = (f"视频短于观察窗（实际 {window_s:.0f}s < "
-                      f"{thresholds.observation_window_s}s），RR 为截断窗口径")
+                      f"{thresholds.observation_window_s}s），RR 为截断窗口径"
+                      "（window_truncated=True，不可与长窗 run 直接比较）")
         out["A11_RR"] = MetricValue(
             metric_id="A11_RR", value=rr, unit="%", status=status,
             reason=reason, flags=flags, quality=q11, unit_scale="none",
