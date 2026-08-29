@@ -1,24 +1,33 @@
-"""two_group.py · 两组对照统计（T05，ComparisonPlan 的特例实现）。
+"""two_group.py · 两组对照统计（T05 · ComparisonPlan 的特例实现）。
 
-职责（docs/06 §6 T05 + docs/04 §6.2）：
-    - `TwoGroupPlan`：**两组对照**是本项目当前唯一的实验设计（第二轮用户
-      决策 ①）。剂量梯度 / 多组 ANOVA 不实现，但通过 ComparisonPlan 抽象
-      留扩展位——新增 `MultiGroupPlan` 即可，本文件与基类都不用改。
+职责（docs/06 §6 T05 + docs/04 §4.4）：
+    - 两组对照是当前唯一的实验设计（第二轮用户决策 ①）；剂量梯度 /
+      多组 ANOVA 不实现，通过 ComparisonPlan 抽象留扩展位——新增子类
+      即可，七条规则与本文件都不用改。
     - 检验选择：正态性（Shapiro–Wilk）+ 方差齐性（Levene）→ 主检验在
-      Welch t 与 Mann–Whitney 之间自动选择，**两个 p 值都输出**（不隐藏
-      与主检验不一致的那一个——选错检验是 p 值造假的经典入口）。
-    - 输出六要素（docs/06 T05 验收 4）：p / Cohen's d / 95%CI / 检验方法名
-      / n / 重复结构说明，缺一不可。
-    - 重复结构（伪重复防线）：pond_id 声明多个池塘 → statsmodels MixedLM
-      （pond 为随机效应）；单池或未声明 → 标注"无独立重复，仅描述性，
-      不可做统计推断"，**此时 p 值仍输出但打 descriptive_only 标记**。
-    - 多重比较：一次 execute() 涉及多个指标 → Holm–Bonferroni 校正 p。
+      Welch t 与 Mann–Whitney 之间自动选择，**两个 p 值都输出**
+      （不隐藏与主检验不一致的那一个——挑检验是 p 值造假的经典入口）。
+    - 输出六要素（docs/06 T05 验收 4）：p / Cohen's d / 95%CI /
+      检验方法名 / n / 重复结构说明，缺一不可。
+    - 重复结构（伪重复防线）：pond_id 声明多池塘 → statsmodels MixedLM
+      （pond 随机效应）；单池或未声明 → descriptive_only（仅描述性）。
+    - 多重比较：run_all() 涉及多指标 → Holm–Bonferroni 校正 p。
+
+规则补齐（docs/06 §6 T05 与 docs/04 §4.4 的差异处置）：
+    docs/06 列的七条含 t0_definition / t0_source，docs/04 §4.4 的七条不含
+    （但含"已关闭指标集"与"非中立门控"两条）。二者是**互补而非互斥**，
+    故 validate() 取并集：规则 1–5 与 6–7 由基类/本类按 docs/04 §4.4 实现，
+    规则 8–9（t0_definition / t0_source）按 docs/06 §6 在此补齐——
+    t0 口径不一致会让所有"相对投喂起点"的时间类指标整体平移数秒，
+    属 reject_all 级。
+    ⚠️ ROI 严重度以 docs/04 §4.4 为准（**warn 不拒绝**）：不同养殖单元
+    的 ROI 本应不同（合法差异），拒绝会误伤；docs/06 的表述未区分此情形。
 
 零值纪律（本项目第一铁律在统计层的落实）：
-    - 任一组可用样本 < 2 → status='unavailable' + reason，**绝不输出 p=1.0
-      或 p=0.5 之类的占位值**；
-    - 样本量不足 / 拟合失败 → None + reason，绝不用 0 冒充；
-    - unavailable/censored 的指标不进样本（RunRef.value_of 已过滤）。
+    - 任一组可用样本 < MIN_N_PER_GROUP → status='unavailable' + reason，
+      **绝不输出 p=1.0 / 0.5 之类的占位值**；
+    - 检验算不出（零方差并列、样本不足）→ None + reason；
+    - unavailable / censored 的指标不进样本（RunBundle.value 已过滤）。
 
 任务编号：T05。
 """
@@ -30,16 +39,30 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from src.stats.comparison_plan import ComparisonPlan, RunRef
+from src.stats.comparison_plan import (
+    NEUTRAL_GROUP_EXIT,
+    NON_NEUTRAL_GATES,
+    ComparisonPlan,
+    ConsistencyReport,
+    RunBundle,
+    Violation,
+)
 
-__all__ = ["TestResult", "TwoGroupPlan", "HOLM_LEVEL"]
+__all__ = [
+    "TestResult",
+    "TwoGroupPlan",
+    "describe_group",
+    "MIN_N_PER_GROUP",
+    "NORMALITY_MIN_N",
+    "HOLM_ALPHA",
+]
 
-HOLM_LEVEL: float = 0.05
-
-# 正态性检验的最小样本数（Shapiro–Wilk 需要 n ≥ 3）
-_MIN_N_FOR_NORMALITY = 3
 # 参数检验的最小样本数（n < 2 无法估计方差 → 无从检验）
-_MIN_N_FOR_TEST = 2
+MIN_N_PER_GROUP: int = 2
+# 正态性检验（Shapiro–Wilk）的最小样本数
+NORMALITY_MIN_N: int = 3
+# 默认显著性水平（同时用于正态性/方差齐性前提检验与 Holm 校正）
+HOLM_ALPHA: float = 0.05
 
 
 # ----------------------------------------------------------------------
@@ -57,14 +80,13 @@ class TestResult:
         mean_a / mean_b: 两组均值（n=0 时为 None）。
         test_used: 主检验方法名（'welch_t' / 'mann_whitney' / 'mixed_lm'）。
         p_value: 主检验 p 值。
-        p_welch / p_mwu: 两种检验的 p 值（都给，不隐藏分歧）。
-        effect_size / effect_size_type: Cohen's d（Hedges 校正）/ 'cohen_d'
-            或秩二列相关 / 'rank_biserial'。
-        ci_low / ci_high / ci_level / ci_of: 95% 置信区间与它描述的对象。
-        normality_ok / equal_var_ok: 前提检验结论（None = 样本不足无法判定）。
-        p_holm: Holm–Bonferroni 校正后 p（多指标同批检验时）。
+        p_welch / p_mwu: 两种检验的 p（都给，不隐藏分歧）。
+        p_holm: Holm–Bonferroni 校正后 p（run_all 多指标时填充）。
+        effect_size / effect_size_type: Cohen's d（Hedges 校正）或秩二列相关。
+        ci_low / ci_high / ci_level / ci_of: 95%CI 与它描述的对象。
+        normality_ok / equal_var_ok: 前提检验结论（None = 无法判定）。
         repeat_structure: 重复结构说明（伪重复防线）。
-        descriptive_only: 单池/未声明 pond_id → True（仅描述性）。
+        descriptive_only: 单池 / pond_id 未声明 → True。
         warnings / notes: 告警与口径说明。
     """
 
@@ -123,46 +145,69 @@ class TestResult:
 
 
 # ----------------------------------------------------------------------
+# 描述统计
+# ----------------------------------------------------------------------
+def describe_group(values: Sequence[float]) -> dict[str, Any]:
+    """单组描述统计（空输入 → n=0 且全部指标为 None，绝不返回 0）。
+
+    为什么单独成函数：compare_page 与 06 脚本都要在**不跑检验**的情况下
+    展示两组分布（散点/箱线图），且必须能在 n<2 时如实显示"样本不足"
+    而不是画一个假的均值。
+    """
+    arr = np.asarray([v for v in values if v is not None], dtype=float)
+    n = int(arr.size)
+    if n == 0:
+        return {
+            "n": 0, "mean": None, "std": None, "median": None,
+            "min": None, "max": None, "iqr": None,
+        }
+    q1, q3 = (float(x) for x in np.percentile(arr, [25.0, 75.0]))
+    return {
+        "n": n,
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr, ddof=1)) if n >= 2 else None,
+        "median": float(np.median(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "iqr": float(q3 - q1),
+    }
+
+
+# ----------------------------------------------------------------------
 # 数值内核（纯函数，可脱离 IO 单测）
 # ----------------------------------------------------------------------
 def _welch_t_test(
-    a: np.ndarray, b: np.ndarray
+    a: np.ndarray, b: np.ndarray, level: float = 0.95,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """Welch t 检验（不假设等方差）。
 
     Returns:
-        (p, ci_low, ci_high, df)：差值为 mean(a) − mean(b)；
-        样本不足（任一组 n<2 或合并方差为 0 且均值相同）→ (None, ...)。
+        (p, ci_low, ci_high, df)，差值口径为 mean(a) − mean(b)；
+        无从检验（n<2 或两组各自零方差且均值相同）→ (None, None, None, None)。
     """
     from scipy import stats
 
     n1, n2 = a.size, b.size
-    if n1 < _MIN_N_FOR_TEST or n2 < _MIN_N_FOR_TEST:
+    if n1 < MIN_N_PER_GROUP or n2 < MIN_N_PER_GROUP:
         return None, None, None, None
     v1 = float(np.var(a, ddof=1))
     v2 = float(np.var(b, ddof=1))
     se = math.sqrt(v1 / n1 + v2 / n2)
     diff = float(np.mean(a) - np.mean(b))
     if se <= 0:
-        # 两组各自零方差：要么完全分离（无检验意义），要么数值全相同
+        # 两组各自零方差：数值全同（无从检验）或完全分离
         return (None, None, None, None) if diff == 0 else (0.0, diff, diff, None)
     df_num = (v1 / n1 + v2 / n2) ** 2
     df_den = (v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1)
     df = df_num / df_den if df_den > 0 else float(n1 + n2 - 2)
     t_stat = diff / se
     p = float(2.0 * stats.t.sf(abs(t_stat), df))
-    t_crit = float(stats.t.ppf(1.0 - (1.0 - 0.95) / 2.0, df))
+    t_crit = float(stats.t.ppf(1.0 - (1.0 - level) / 2.0, df))
     return p, diff - t_crit * se, diff + t_crit * se, df
 
 
-def _mann_whitney(
-    a: np.ndarray, b: np.ndarray
-) -> tuple[float | None, float | None]:
-    """Mann–Whitney U 检验 + 秩二列相关（= Cliff's delta）效应量。
-
-    Returns:
-        (p, rank_biserial)：样本不足或全部并列 → (None, None)。
-    """
+def _mann_whitney(a: np.ndarray, b: np.ndarray) -> tuple[float | None, float | None]:
+    """Mann–Whitney U + 秩二列相关（= Cliff's delta）效应量。"""
     from scipy import stats
 
     if a.size < 1 or b.size < 1:
@@ -172,19 +217,17 @@ def _mann_whitney(
     except ValueError:
         return None, None
     u = float(res.statistic)
-    p = float(res.pvalue)
-    # 秩二列相关：r = 2U/(n1·n2) − 1，取值 [-1, 1]（1 = a 全部大于 b）
-    return p, (2.0 * u / (a.size * b.size) - 1.0)
+    return float(res.pvalue), (2.0 * u / (a.size * b.size) - 1.0)
 
 
 def _cohens_d(a: np.ndarray, b: np.ndarray) -> float | None:
-    """Cohen's d（合并标准差口径）+ Hedges 小样本校正 g。
+    """Cohen's d（合并标准差口径）+ Hedges 小样本校正。
 
-    为什么做 Hedges 校正：n 小（本项目常见 n=3~6）时 Cohen's d 高估约
-    4%~10%，g = d·(1 − 3/(4(n1+n2)−9)) 是无偏估计。
+    为什么校正：n 小（本项目常见 n=3~6）时 d 高估约 4%~10%，
+    g = d·(1 − 3/(4(n1+n2)−9)) 近似无偏。
     """
     n1, n2 = a.size, b.size
-    if n1 < _MIN_N_FOR_TEST or n2 < _MIN_N_FOR_TEST:
+    if n1 < MIN_N_PER_GROUP or n2 < MIN_N_PER_GROUP:
         return None
     v1 = float(np.var(a, ddof=1))
     v2 = float(np.var(b, ddof=1))
@@ -196,23 +239,23 @@ def _cohens_d(a: np.ndarray, b: np.ndarray) -> float | None:
     return d * (1.0 - 3.0 / denom) if denom > 0 else d
 
 
-def _normality_ok(x: np.ndarray, alpha: float = HOLM_LEVEL) -> bool | None:
+def _normality_ok(x: np.ndarray, alpha: float) -> bool | None:
     """Shapiro–Wilk 正态性（n < 3 无法判定 → None，绝不猜 True）。"""
     from scipy import stats
 
-    if x.size < _MIN_N_FOR_NORMALITY:
+    if x.size < NORMALITY_MIN_N:
         return None
     try:
         return bool(stats.shapiro(x).pvalue > alpha)
-    except Exception:  # scipy 极端输入（全相同）可能抛错
+    except Exception:
         return None
 
 
-def _equal_var_ok(a: np.ndarray, b: np.ndarray, alpha: float = HOLM_LEVEL) -> bool | None:
+def _equal_var_ok(a: np.ndarray, b: np.ndarray, alpha: float) -> bool | None:
     """Levene 方差齐性（任一组 n < 2 → None）。"""
     from scipy import stats
 
-    if a.size < _MIN_N_FOR_TEST or b.size < _MIN_N_FOR_TEST:
+    if a.size < MIN_N_PER_GROUP or b.size < MIN_N_PER_GROUP:
         return None
     try:
         return bool(stats.levene(a, b).pvalue > alpha)
@@ -221,24 +264,15 @@ def _equal_var_ok(a: np.ndarray, b: np.ndarray, alpha: float = HOLM_LEVEL) -> bo
 
 
 def _holm_adjust(pairs: list[tuple[str, float | None]]) -> dict[str, float | None]:
-    """Holm–Bonferroni 逐步校正（比 Bonferroni 更有检验效能且控制 FWER）。
-
-    Args:
-        pairs: [(metric_id, p)]，p=None 的项不参与校正（保留 None）。
-
-    Returns:
-        metric_id → 校正后 p（原始 p=None 的项仍为 None）。
-    """
-    valid = [(k, p) for k, p in pairs if p is not None]
+    """Holm–Bonferroni 逐步校正（控制 FWER，比 Bonferroni 更有检验效能）。"""
+    valid = sorted([(k, p) for k, p in pairs if p is not None], key=lambda kv: kv[1])
     out: dict[str, float | None] = {k: None for k, _ in pairs}
     if not valid:
         return out
-    valid.sort(key=lambda kv: kv[1])
     m = len(valid)
     running = 0.0
     for i, (k, p) in enumerate(valid):
-        adj = min(1.0, (m - i) * p)
-        running = max(running, adj)  # 单调化（Holm 要求）
+        running = max(running, min(1.0, (m - i) * p))
         out[k] = float(running)
     return out
 
@@ -251,201 +285,193 @@ class TwoGroupPlan(ComparisonPlan):
 
     用法::
 
-        refs = load_run_refs([run_a1, run_a2, run_b1], groups=['A','A','B'])
-        plan = TwoGroupPlan(refs, groups=('A', 'B'))
-        result = plan.run(["A8_T50", "A11_RR"])
-        # result.ok=False 时读 result.differences（七条规则差异 + 重跑提示）
+        plan = TwoGroupPlan(bundles, group_a="A", group_b="B")
+        report = plan.validate()
+        if report.ok:
+            res = plan.execute("A8_T50")      # 单指标
+            all_res = plan.run_all(["A8_T50", "A11_RR"])   # 含 Holm 校正
     """
 
-    name = "two_group"
+    name: str = "two_group"
 
     def __init__(
         self,
-        refs: Sequence[RunRef],
-        groups: tuple[str, str] = ("A", "B"),
-        alpha: float = HOLM_LEVEL,
+        runs: Sequence[RunBundle],
+        group_a: str = "A",
+        group_b: str = "B",
+        alpha: float = HOLM_ALPHA,
     ) -> None:
-        super().__init__(refs)
-        self.groups: tuple[str, str] = (str(groups[0]), str(groups[1]))
+        super().__init__(runs)
+        self.group_a = str(group_a)
+        self.group_b = str(group_b)
         self.alpha = float(alpha)
 
     # ------------------------------------------------------------------
-    def validate(self) -> list[str]:
-        """结构校验：必须恰好两组、每组至少一个 run（硬失败）。"""
-        problems: list[str] = []
-        groups_present = {r.group for r in self.refs if r.group is not None}
-        if len(groups_present) != 2:
-            problems.append(
-                f"两组比较需要恰好 2 个组标签，收到 {sorted(groups_present)}"
-                f"（共 {len(self.refs)} 个 run）"
-            )
-            return problems
-        for g in self.groups:
-            if not any(r.group == g for r in self.refs):
-                problems.append(f"组 {g!r} 无 run")
-        for g in sorted(groups_present):
-            n = sum(1 for r in self.refs if r.group == g)
-            if n < 1:
-                problems.append(f"组 {g!r} 无 run")
-        return problems
+    def group_labels(self) -> list[str]:
+        """分组标签（盲法下由调用方传入盲法编号作为 group 值）。"""
+        return [self.group_a, self.group_b]
+
+    def _runs_of(self, group: str) -> list[RunBundle]:
+        return [r for r in self.runs if r.group == group]
 
     # ------------------------------------------------------------------
-    def _split(self, metric_id: str) -> tuple[list[float], list[float]]:
-        """按组取可用值（不可用/删失/未输出一律不进样本）。"""
-        a: list[float] = []
-        b: list[float] = []
-        for ref in self.refs:
-            v = ref.value_of(metric_id)
-            if v is None or ref.status_of(metric_id) not in ("ok", "degraded"):
+    # 一致性校验（七条 §4.4 + t0 两条 §6，取并集）
+    # ------------------------------------------------------------------
+    def validate(self) -> ConsistencyReport:
+        """比较前一致性校验（规则 1–9）。
+
+        Returns:
+            ConsistencyReport：ok=False 时调用方**不得**执行 execute()
+            （本类不提供绕过开关——口径不一致时的 p 值是精确的废话）。
+        """
+        report = ConsistencyReport()
+        metric_ids = sorted({m for r in self.runs for m in r.metrics})
+        self._check_config_rules(report, metric_ids)
+        self._check_t0_rules(report, metric_ids)
+        self._check_metric_set_rules(report, metric_ids)
+
+        groups = {r.group for r in self.runs}
+        if len(groups) != 2:
+            report.violations.append(Violation(
+                rule_id=0, rule_name="两组结构", action="reject_all",
+                message=(
+                    f"两组比较需要恰好 2 个组标签，收到 {sorted(groups)}"
+                    f"（共 {len(self.runs)} 个 run）"
+                ),
+                affected_metrics=list(metric_ids),
+                exit_hint="请在比较页为每个 run 指定所属组别。",
+            ))
+        for g in (self.group_a, self.group_b):
+            if not self._runs_of(g):
+                report.violations.append(Violation(
+                    rule_id=0, rule_name="两组结构", action="reject_all",
+                    message=f"组 {g!r} 无 run：无法比较。",
+                    affected_metrics=list(metric_ids),
+                    exit_hint="请至少为每组选择 1 个 run。",
+                ))
+        return report
+
+    # ------------------------------------------------------------------
+    def _check_t0_rules(
+        self, report: ConsistencyReport, metric_ids: Sequence[str]
+    ) -> None:
+        """规则 8/9（docs/06 §6 T05）：t0_definition / t0_source 一致性。
+
+        t0 是全部时间类指标的原点。定义不同（投饵器启动 / 饲料离开投饵器 /
+        饲料入画面）可差出数秒，来源不同（手动打点 vs 自动检测）误差量级
+        也不同——两者任一不一致，所有"相对投喂起点"的指标都换了意思。
+        """
+        cfgs = [r.config for r in self.runs]
+        base = cfgs[0]
+        for rule_id, field_name, label in (
+            (8, "t0_definition", "t0 定义"),
+            (9, "t0_source", "t0 来源"),
+        ):
+            vals = {str(getattr(c, field_name, "")) for c in cfgs}
+            if len(vals) > 1:
+                report.violations.append(Violation(
+                    rule_id=rule_id, rule_name=f"{label}一致性",
+                    action="reject_all",
+                    message=(
+                        f"各 run 的{label}不一致：" +
+                        "、".join(f"{r.run_id}={getattr(r.config, field_name, '')!r}"
+                                  for r in self.runs) +
+                        "。t0 是全部时间类指标的原点，口径不同则所有"
+                        "相对投喂起点的指标整体平移，不可比。"
+                    ),
+                    affected_metrics=list(metric_ids),
+                    exit_hint="请用同一 t0 定义与来源重新分析上述 run（单段约 4 秒）。",
+                ))
+
+    # ------------------------------------------------------------------
+    def _check_metric_set_rules(
+        self, report: ConsistencyReport, metric_ids: Sequence[str]
+    ) -> None:
+        """规则 6（已关闭指标集不同 → 告警）+ 规则 7（非中立门控 → 拒绝）。"""
+        for mid in metric_ids:
+            have = [r for r in self.runs
+                    if r.status(mid) in ("ok", "degraded") and r.value(mid) is not None]
+            miss = [r for r in self.runs if r not in have]
+            if not miss or not have:
+                if not have:
+                    report.notes.append(
+                        f"{mid}：所有 run 均不可用（无样本），跳过比较。"
+                    )
                 continue
-            if ref.group == self.groups[0]:
-                a.append(v)
-            elif ref.group == self.groups[1]:
-                b.append(v)
-        return a, b
+
+            # ---- 规则 6：可用集不一致 → warn（缺失可能非随机）----
+            report.violations.append(Violation(
+                rule_id=6, rule_name="已关闭指标集一致性", action="warn",
+                message=(
+                    f"{mid} 的可用集不一致：{sorted(r.run_id for r in have)} 有值，"
+                    f"{sorted(r.run_id for r in miss)} 不可用。"
+                    "缺失可能是效应本身（高摄食强度会降低检测/跟踪质量），"
+                    "跨组比较存在非随机缺失风险。"
+                ),
+                affected_metrics=[mid],
+                exit_hint="请核对 capability_report.md 中该指标的关闭原因。",
+            ))
+
+            # ---- 规则 7：缺失由非中立门控触发 → 拒绝对可用子集做推断 ----
+            non_neutral = []
+            for r in miss:
+                gates = _triggered_gates(r)
+                if gates & NON_NEUTRAL_GATES:
+                    non_neutral.append((r.run_id, sorted(gates & NON_NEUTRAL_GATES)))
+            if non_neutral:
+                report.violations.append(Violation(
+                    rule_id=7, rule_name="非中立门控缺失", action="reject_metrics",
+                    message=(
+                        f"{mid} 的缺失由非中立门控触发：" +
+                        "、".join(f"{rid}({','.join(g)})" for rid, g in non_neutral) +
+                        "。这些门控的误差随被测效应变化，"
+                        "对『算得出来的那些』做统计推断 = 以结果为条件抽样。"
+                    ),
+                    affected_metrics=[mid],
+                    exit_hint=NEUTRAL_GROUP_EXIT,
+                ))
+                report.rejected_metrics.add(mid)
 
     # ------------------------------------------------------------------
-    def execute(
-        self, metric_ids: Sequence[str] | None = None,
-    ) -> dict[str, dict[str, Any]]:
-        """逐指标执行检验（基类已保证七条规则通过后才调用本方法）。"""
-        from src.stats.comparison_plan import ComparisonResult
-
-        # result 仅用于承载共用告警；execute 的契约是返回 tests 字典
-        carrier = ComparisonResult(plan_name=self.name)
-        self.check_pseudoreplication(carrier)
-
-        targets: list[str] = list(metric_ids) if metric_ids else sorted(
-            {mid for r in self.refs for mid in r.metrics}
-        )
-        results: dict[str, dict[str, Any]] = {}
-        raw_p: list[tuple[str, float | None]] = []
-        rejected: list[str] = list(getattr(self, "_rejected_metrics", []))
-        for mid in targets:
-            if mid in rejected:
-                results[mid] = TestResult(
-                    metric_id=mid, status="unavailable",
-                    reason="该指标被一致性校验额外拒绝（如 px_per_mm 不一致 → "
-                           "unnormalized 指标不可跨 run 比较）",
-                ).to_dict()
-                raw_p.append((mid, None))
-                continue
-            res = self._test_one(mid)
-            # 共用告警（可用集不一致 = 非随机缺失风险）
-            self.check_available_set_diff(carrier, mid)
-            results[mid] = res.to_dict()
-            raw_p.append((mid, res.p_value))
-
-        holm = _holm_adjust(raw_p)
-        for mid, adj in holm.items():
-            if mid in results:
-                results[mid]["p_holm"] = adj
-
-        # 把共用告警/说明回填到每个指标（UI 逐行展示时也能看到）
-        for mid in results:
-            results[mid]["warnings"] = list(
-                dict.fromkeys(
-                    list(results[mid].get("warnings", [])) + carrier.warnings
-                )
-            )
-            results[mid]["notes"] = list(
-                dict.fromkeys(list(results[mid].get("notes", [])) + carrier.notes)
-            )
-        return results
-
+    # 统计执行
     # ------------------------------------------------------------------
-    def _test_one(self, metric_id: str) -> TestResult:
-        vals_a, vals_b = self._split(metric_id)
+    def execute(self, metric_id: str) -> TestResult:
+        """对单个指标执行两组检验（校验未通过时调用方不得调用本方法）。"""
+        a_runs = self._runs_of(self.group_a)
+        b_runs = self._runs_of(self.group_b)
+        vals_a = _values_of(a_runs, metric_id)
+        vals_b = _values_of(b_runs, metric_id)
         a = np.asarray(vals_a, dtype=float)
         b = np.asarray(vals_b, dtype=float)
         res = TestResult(metric_id=metric_id, n_a=int(a.size), n_b=int(b.size))
 
-        # ---- 重复结构（伪重复防线）----
-        ponds = {r.pond_id for r in self.refs if r.pond_id is not None}
-        if not ponds:
-            res.repeat_structure = "重复结构未知（pond_id 未声明）"
-            res.descriptive_only = True
-        elif len(ponds) == 1:
-            res.repeat_structure = (
-                f"单池塘（pond_id={sorted(ponds)[0]}）：{len(self.refs)} 次投喂"
-                "属伪重复，仅描述性，不可做统计推断"
-            )
-            res.descriptive_only = True
-        else:
-            res.repeat_structure = (
-                f"{len(ponds)} 个池塘（{sorted(ponds)}）/ {len(self.refs)} 次投喂"
-                "：以 pond 为随机效应的混合模型"
-            )
+        # ---- 重复结构（伪重复防线，先于一切统计）----
+        res.repeat_structure, res.descriptive_only = self._repeat_structure()
 
         # ---- 样本量硬门（零值纪律：不输出占位 p）----
-        if a.size < _MIN_N_FOR_TEST or b.size < _MIN_N_FOR_TEST:
+        if a.size < MIN_N_PER_GROUP or b.size < MIN_N_PER_GROUP:
             res.status = "unavailable"
             res.reason = (
-                f"样本量不足（{self.groups[0]}={a.size}, {self.groups[1]}={b.size}）："
-                "至少各需 2 个可用值才能估计方差；"
+                f"样本量不足（{self.group_a}={a.size}, {self.group_b}={b.size}）："
+                f"至少各需 {MIN_N_PER_GROUP} 个可用值才能估计方差；"
                 "不输出 p 值（严禁以 p=1.0/0.5 等占位值冒充）"
             )
             return res
 
         res.mean_a = float(np.mean(a))
         res.mean_b = float(np.mean(b))
-        res.normality_ok = (
-            (_normality_ok(a, self.alpha) is True)
-            and (_normality_ok(b, self.alpha) is True)
-        ) if (a.size >= _MIN_N_FOR_NORMALITY and b.size >= _MIN_N_FOR_NORMALITY) else None
+        res.normality_ok = self._normality_both(a, b)
         res.equal_var_ok = _equal_var_ok(a, b, self.alpha)
 
         # ---- 两个检验都跑（不隐藏与主检验不一致的那一个）----
-        p_welch, ci_lo, ci_hi, _df = _welch_t_test(a, b)
+        p_welch, ci_lo, ci_hi, _df = _welch_t_test(a, b, res.ci_level)
         p_mwu, rank_biserial = _mann_whitney(a, b)
         d = _cohens_d(a, b)
-        res.p_welch = p_welch
-        res.p_mwu = p_mwu
-        res.ci_low, res.ci_high = ci_lo, ci_hi
-        res.ci_of = "mean_diff(a-b)"
+        res.p_welch, res.p_mwu = p_welch, p_mwu
+        res.ci_low, res.ci_high, res.ci_of = ci_lo, ci_hi, "mean_diff(a-b)"
 
-        if res.normality_ok is None:
-            res.notes.append(
-                f"样本量不足（n<{_MIN_N_FOR_NORMALITY}）无法判定正态性："
-                "以非参数 Mann–Whitney 为主检验（保守口径）"
-            )
-            primary = "mann_whitney"
-        elif res.normality_ok:
-            primary = "welch_t"
-            res.notes.append(
-                "两组均通过正态性检验（Shapiro–Wilk p > "
-                f"{self.alpha}）：以 Welch t 为主检验"
-            )
-        else:
-            primary = "mann_whitney"
-            res.notes.append(
-                "至少一组未通过正态性检验：以 Mann–Whitney 为主检验"
-                "（Welch p 值一并给出，供交叉核对）"
-            )
-        if res.equal_var_ok is False:
-            res.notes.append(
-                "方差齐性未通过（Levene）：已使用 Welch 校正（不假设等方差）"
-            )
-
-        # ---- 多池塘 → 混合模型（pond 随机效应）为主检验 ----
-        if not res.descriptive_only and len(ponds) > 1:
-            mixed = self._mixed_lm(metric_id)
-            if mixed is not None:
-                p_mixed, note = mixed
-                res.p_value = p_mixed
-                res.test_used = "mixed_lm"
-                res.notes.append(note)
-                res.notes.append(
-                    "Welch / Mann–Whitney p 值保留在 p_welch / p_mwu 字段供对照"
-                )
-                res.effect_size = d
-                res.effect_size_type = "cohen_d_hedges_g" if d is not None else None
-                res.status = "ok"
-                self._warn_divergence(res)
-                return res
-
-        res.test_used = primary
-        if primary == "welch_t":
+        res.test_used = self._pick_primary(res, a, b)
+        if res.test_used == "welch_t":
             res.p_value = p_welch
             res.effect_size = d
             res.effect_size_type = "cohen_d_hedges_g" if d is not None else None
@@ -454,29 +480,124 @@ class TwoGroupPlan(ComparisonPlan):
             res.effect_size = rank_biserial
             res.effect_size_type = "rank_biserial"
             res.notes.append(
-                "效应量为秩二列相关（Cliff's delta 同值）；"
-                "CI 仍是均值差的 Welch 区间（非中位数位移），解读时勿混用"
+                "效应量为秩二列相关（= Cliff's delta）；CI 仍是均值差的 Welch 区间"
+                "（非中位数位移），解读时勿混用口径"
             )
+
+        # ---- 多池塘 → MixedLM（pond 随机截距）为主检验 ----
+        if not res.descriptive_only:
+            mixed = self._mixed_lm(metric_id)
+            if mixed is not None:
+                p_mixed, note = mixed
+                res.p_value = p_mixed
+                res.test_used = "mixed_lm"
+                res.effect_size = d
+                res.effect_size_type = "cohen_d_hedges_g" if d is not None else None
+                res.notes.append(note)
+                res.notes.append(
+                    "Welch / Mann–Whitney p 值保留在 p_welch / p_mwu 字段供交叉核对"
+                )
+
         if res.p_value is None:
             res.status = "unavailable"
             res.reason = (
                 "检验未能给出 p 值（两组数值完全并列或零方差）："
-                "不输出占位值，请检查该指标是否退化为常数"
+                "不输出占位值，请检查该指标是否已退化为常数"
             )
             return res
+
         res.status = "ok"
         if res.descriptive_only:
             res.warnings.append(
                 "descriptive_only：无独立重复（单池或 pond_id 未声明），"
                 "p 值与效应量仅供描述，**不可做统计推断**"
             )
+        if res.equal_var_ok is False:
+            res.notes.append(
+                "方差齐性未通过（Levene）：已使用 Welch 校正（不假设等方差）"
+            )
         self._warn_divergence(res)
         return res
 
     # ------------------------------------------------------------------
+    def run_all(
+        self, metric_ids: Sequence[str] | None = None
+    ) -> dict[str, TestResult]:
+        """批量执行 + Holm 多重比较校正（UI / 导出的主入口）。
+
+        Returns:
+            metric_id → TestResult；被 rejected_metrics 拒绝的指标返回
+            status='unavailable' + reason（照常占位，但绝不给出 p 值）。
+        """
+        report = self.validate()
+        targets = list(metric_ids) if metric_ids else sorted(
+            {m for r in self.runs for m in r.metrics}
+        )
+        out: dict[str, TestResult] = {}
+        for mid in targets:
+            if mid in report.rejected_metrics:
+                out[mid] = TestResult(
+                    metric_id=mid, status="unavailable",
+                    reason="该指标被比较前一致性校验拒绝"
+                           "（口径不一致 / 非中立门控缺失），不输出 p 值",
+                )
+            else:
+                out[mid] = self.execute(mid)
+        holm = _holm_adjust([(mid, r.p_value) for mid, r in out.items()])
+        for mid, adj in holm.items():
+            out[mid].p_holm = adj
+        return out
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
+    def _pick_primary(self, res: TestResult, a: np.ndarray, b: np.ndarray) -> str:
+        """主检验选择（正态性为准；样本不足判不出 → 保守走非参数）。"""
+        if res.normality_ok is None:
+            res.notes.append(
+                f"样本量不足（n < {NORMALITY_MIN_N}）无法判定正态性："
+                "以非参数 Mann–Whitney 为主检验（保守口径）"
+            )
+            return "mann_whitney"
+        if res.normality_ok:
+            res.notes.append(
+                f"两组均通过正态性检验（Shapiro–Wilk p > {self.alpha}）："
+                "以 Welch t 为主检验"
+            )
+            return "welch_t"
+        res.notes.append(
+            "至少一组未通过正态性检验：以 Mann–Whitney 为主检验"
+            "（Welch p 值一并给出，供交叉核对）"
+        )
+        return "mann_whitney"
+
+    def _normality_both(self, a: np.ndarray, b: np.ndarray) -> bool | None:
+        na = _normality_ok(a, self.alpha)
+        nb = _normality_ok(b, self.alpha)
+        if na is None or nb is None:
+            return None
+        return bool(na and nb)
+
+    def _repeat_structure(self) -> tuple[str, bool]:
+        """(重复结构说明, 是否仅描述性)。"""
+        ponds = {r.pond_id for r in self.runs if r.pond_id is not None}
+        if not ponds:
+            return ("重复结构未知（全部 run 均未声明 pond_id）", True)
+        if len(ponds) == 1:
+            return (
+                f"单池塘（pond_id={sorted(ponds)[0]}，{len(self.runs)} 次投喂）："
+                "同一池塘多次投喂属伪重复，仅描述性，不可做统计推断",
+                True,
+            )
+        return (
+            f"{len(ponds)} 个池塘（{sorted(ponds)}）/ {len(self.runs)} 次投喂："
+            "以 pond 为随机效应的混合模型",
+            False,
+        )
+
     @staticmethod
     def _warn_divergence(res: TestResult) -> None:
-        """两个检验结论方向不一致 → 显式告警（不静默挑一个好看的）。"""
+        """两检验结论方向不一致 → 显式告警（不静默挑一个好看的）。"""
         pa, pb = res.p_welch, res.p_mwu
         if pa is None or pb is None:
             return
@@ -487,12 +608,11 @@ class TwoGroupPlan(ComparisonPlan):
                 "请以效应量与原始数据分布为准，勿只报显著的那一个"
             )
 
-    # ------------------------------------------------------------------
     def _mixed_lm(self, metric_id: str) -> tuple[float, str] | None:
         """statsmodels MixedLM（pond 随机截距）；不可拟合 → None（不猜）。
 
-        仅在 ≥2 个池塘、≥3 个观测量时调用；任何异常都回退（回退事实会
-        写入 notes，绝不静默）。
+        仅在 ≥2 池塘且 ≥3 观测量时调用；任何异常都回退（回退事实体现在
+        主检验仍为 Welch/MW，绝不静默给错 p）。
         """
         try:
             import pandas as pd
@@ -501,25 +621,67 @@ class TwoGroupPlan(ComparisonPlan):
             return None
 
         rows: list[dict[str, Any]] = []
-        for ref in self.refs:
-            v = ref.value_of(metric_id)
-            if v is None or ref.status_of(metric_id) not in ("ok", "degraded"):
+        for r in self.runs:
+            v = r.value(metric_id)
+            if v is None or r.status(metric_id) not in ("ok", "degraded"):
                 continue
-            if ref.pond_id is None or ref.group is None:
+            if r.pond_id is None or r.group not in (self.group_a, self.group_b):
                 continue
-            rows.append({"value": float(v), "group": ref.group, "pond": ref.pond_id})
-        if len(rows) < 3 or len({r["pond"] for r in rows}) < 2:
+            rows.append({"value": float(v), "group": r.group, "pond": r.pond_id})
+        if len(rows) < 3 or len({x["pond"] for x in rows}) < 2:
             return None
         try:
             df = pd.DataFrame(rows)
-            model = smf.mixedlm("value ~ C(group)", df, groups=df["pond"])
-            fit = model.fit(reml=True)
-            key = [k for k in fit.pvalues.index if "group" in k]
-            if not key:
+            fit = smf.mixedlm("value ~ C(group)", df, groups=df["pond"]).fit(reml=True)
+            keys = [k for k in fit.pvalues.index if "group" in k]
+            if not keys:
                 return None
             return (
-                float(fit.pvalues[key[0]]),
+                float(fit.pvalues[keys[0]]),
                 f"MixedLM（value ~ C(group)，pond 随机截距，REML，n={len(rows)}）",
             )
         except Exception:
             return None
+
+
+# ----------------------------------------------------------------------
+# 模块级工具
+# ----------------------------------------------------------------------
+def _values_of(runs: Sequence[RunBundle], metric_id: str) -> list[float]:
+    """取一组内所有可用值（不可用/删失/未输出一律不入样本）。"""
+    out: list[float] = []
+    for r in runs:
+        if r.status(metric_id) not in ("ok", "degraded"):
+            continue
+        v = r.value(metric_id)
+        if v is not None:
+            out.append(float(v))
+    return out
+
+
+def _triggered_gates(run: RunBundle) -> set[str]:
+    """该 run 上被触发的门控名（用于规则 7 的非中立门控判定）。
+
+    只认"实测信号确实越限"这一种触发；未测得（None）不算触发
+    （未测得 ≠ 测得为差，docs/04 §4.0）。
+    """
+    th = run.config.thresholds
+    q = run.quality or {}
+    gates: set[str] = set()
+    v = q.get("Q_track")
+    if v is not None and v < th.q_track_min:
+        gates.add("Q_track")
+    v = q.get("Q_det")
+    if v is not None and v < th.q_det_min:
+        gates.add("Q_det")
+    v = q.get("Q_fg")
+    if v is not None and v < th.q_fg_min:
+        gates.add("Q_fg")
+    v = q.get("Q_overlap")
+    if v is not None and v > 0.30:
+        gates.add("Q_overlap")
+    # 指标行上的 low_conf flag 同样是"依赖检测质量"的非中立信号
+    for mid in run.metrics:
+        if "low_conf" in run.flags(mid):
+            gates.add("Q_det")
+    return gates

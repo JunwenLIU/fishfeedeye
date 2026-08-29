@@ -1,36 +1,40 @@
-"""统计层（T05，跨 run 比较与两组对照）。
+"""统计层（T05）。
 
-    - comparison_plan：ComparisonPlan 抽象 + RunRef + 七条比较前一致性
-      校验规则（拒绝即列出差异 + 重跑提示，**无强制比较开关**）；
-    - two_group：TwoGroupPlan（两组对照 = ComparisonPlan 特例）——
-      Welch t / Mann–Whitney 自动选择 + Cohen's d（Hedges 校正）+
-      95%CI + n + 重复结构说明 + 多池塘 MixedLM + Holm 多重比较校正。
+    - comparison_plan.py：ComparisonPlan 抽象 + 七条比较前一致性规则
+      （两组对照是特例；剂量梯度留扩展位）；
+    - two_group.py：TwoGroupPlan（Welch t / Mann-Whitney / MixedLM +
+      Cohen's d + 95%CI + 重复结构说明）。
 
-纪律：
-    - 样本量不足不输出 p 值（绝不占位）；
-    - 两个检验的 p 值都给，结论不一致时显式告警；
-    - 单池 / pond_id 未声明 → descriptive_only（仅描述性，不可推断）。
-
-任务编号：T05。
+纪律：宁可不给 p 值，不可给错的 p 值；伪重复必须显式标注。
 """
 from src.stats.comparison_plan import (
-    CONSISTENCY_RULES,
-    RULE_DESCRIPTIONS,
+    CLEARANCE_LIKE_METRICS,
+    NEUTRAL_GROUP_EXIT,
+    NON_NEUTRAL_GATES,
     ComparisonPlan,
-    ComparisonResult,
-    RunRef,
-    check_consistency,
-    load_run_refs,
+    ConsistencyReport,
+    RunBundle,
+    Rule,
+    Violation,
 )
-from src.stats.two_group import TwoGroupPlan
+from src.stats.two_group import (
+    MIN_N_PER_GROUP,
+    TestResult,
+    TwoGroupPlan,
+    describe_group,
+)
 
 __all__ = [
-    "CONSISTENCY_RULES",
-    "RULE_DESCRIPTIONS",
     "ComparisonPlan",
-    "ComparisonResult",
-    "RunRef",
+    "ConsistencyReport",
+    "RunBundle",
+    "Rule",
+    "Violation",
+    "NON_NEUTRAL_GATES",
+    "NEUTRAL_GROUP_EXIT",
+    "CLEARANCE_LIKE_METRICS",
     "TwoGroupPlan",
-    "check_consistency",
-    "load_run_refs",
+    "TestResult",
+    "describe_group",
+    "MIN_N_PER_GROUP",
 ]

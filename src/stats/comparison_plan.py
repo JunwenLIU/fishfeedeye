@@ -1,465 +1,398 @@
-"""comparison_plan.py · 比较计划抽象（T05，统计层入口）。
+"""stats/comparison_plan.py · 比较计划抽象（T05）。
 
-职责（docs/06 §6 T05 + docs/04 §6.2）：
-    - `ComparisonPlan`：**抽象基类**，定义"一组 run 之间怎么比"的契约。
-      两组对照（TwoGroupPlan）是本项目的特例实现；剂量梯度 / 多组方差
-      分析留扩展位（只加子类，不动基类）——第二轮用户决策 ①。
-    - `RunRef`：参与比较的最小单元（run 目录 + 指标表 + run_config +
-      重复结构声明），把"从磁盘读什么"收在一处，统计层不碰 IO 细节。
-    - 七条比较前一致性校验（compare_rules）：跨 run 比较的**硬门**，
-      任一不一致即拒绝，**不提供"用户强制比较"绕过开关**。
+职责（docs/06 §6 T05 内联约定 + docs/04 §4.4）：
+    - **ComparisonPlan 抽象**：比较是"一组 run 按某个设计映射到分组、逐指标
+      做统计推断"的过程。两组对照是它的一个特例（TwoGroupPlan），剂量梯度
+      留扩展位（`DoseResponsePlan` 占位不实现，见 §6 第二轮决策 ①）；
+    - **比较前一致性校验（七条拒绝规则）**：任一硬规则不一致 → 拒绝整份
+      比较并列出差异，附"重跑对齐约 4 秒"的出路提示；
+      ⚠️ **不提供"用户强制比较"的绕过开关**（docs/04 §4.4：覆盖开关会
+      诱导用户绕过保护，而这类偏差不可察觉；给一条更好的路，而不是一个
+      绕过防护的按钮）；
+    - **可用指标集一致性告警**：两组被关闭的指标集不同 → 告警"缺失可能
+      非随机"（docs/04 §4.3 第 4 类 + §4.4 规则 6/7）。
 
-为什么必须先校验（docs/04 §4 伪重复 + §7.3）：
-    两组之间的系统差异若来自参数/口径而非处理效应，p 值就是精确的废话。
-    七条规则覆盖：规范版本、模型指纹、t0 定义、t0 来源、观察窗、ROI、
-    标定尺度——即"所有会让同一个数字换一个意思"的旋钮。
+七条规则（docs/04 §4.4）：
+    1 px_per_mm 不一致 → 拒绝比较任何带 unnormalized 的指标；
+    2 metrics_spec_version 不一致 → 拒绝整份比较；
+    3 model_md5 不一致 → 拒绝全部比较；
+    4 window_s 不一致 或 任一 run window_truncated → 拒绝 RR 与清空时间类；
+    5 ROI 不一致（面积差>5% 或 IoU<0.95）→ 告警，不拒绝；
+    6 两组已关闭指标集不同 → 告警；
+    7 缺失由非中立门控触发 → 拒绝对"可用子集"做统计推断，并给出
+      改用 B1-1/2/3 的出路。
 
 任务编号：T05。
 """
 from __future__ import annotations
 
-import json
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from src.core.config import RunConfig
 
 __all__ = [
-    "RunRef",
     "ComparisonPlan",
-    "ComparisonResult",
-    "CONSISTENCY_RULES",
-    "RULE_DESCRIPTIONS",
-    "check_consistency",
-    "load_run_refs",
+    "RunBundle",
+    "Rule",
+    "Violation",
+    "ConsistencyReport",
+    "NON_NEUTRAL_GATES",
+    "NEUTRAL_GROUP_EXIT",
+    "CLEARANCE_LIKE_METRICS",
 ]
 
-# ----------------------------------------------------------------------
-# 七条一致性规则（docs/06 §6 T05；compare.py 硬校验，不可绕过）
-# ----------------------------------------------------------------------
-CONSISTENCY_RULES: tuple[str, ...] = (
-    "metrics_spec_version",  # 1. 指标规范版本（决定"什么叫干净"的清单）
-    "model_md5",             # 2. 模型指纹（换权重 = 换了一把尺子）
-    "t0_definition",         # 3. t0 定义（三种口径差出好几秒）
-    "t0_source",             # 4. t0 来源（手动/自动，可比性不同）
-    "window_s",              # 5. 观察窗长（删失口径不同则 T50 不可比）
-    "roi",                   # 6. ROI 定义（区域不同则计数口径不同）
-    "sampling",              # 7. 采样三元组（非对称采样参数不同则曲线不可比）
+# 非中立门控（docs/04 §4.4 规则 7）：其触发的缺失具信息性，
+# 对"可用子集"做统计推断 = 以结果为条件抽样。
+NON_NEUTRAL_GATES: frozenset[str] = frozenset(
+    {"Q_track", "Q_overlap", "Q_det", "Q_fg"}
 )
 
-RULE_DESCRIPTIONS: dict[str, str] = {
-    "metrics_spec_version": "指标规范版本：决定「什么叫干净」的阻断清单版本",
-    "model_md5": "模型指纹：换权重等价于换了一把尺子",
-    "t0_definition": "t0 定义（投饵器启动/饲料离开投饵器/饲料入画面）：三种口径差出数秒",
-    "t0_source": "t0 来源（manual/auto）：自动打点误差不参与跨组比较",
-    "window_s": "观察窗长：窗长不同则右删失口径不同，T50 不可比",
-    "roi": "ROI 定义（投喂区/参考区/排除区）：区域不同则计数分母不同",
-    "sampling": "采样三元组（2s/1s/10s）：非对称采样参数不同则曲线不可比",
-}
+# 规则 7 触发时给用户的出路（不是"确认继续"按钮，而是一条更好的路）。
+NEUTRAL_GROUP_EXIT: str = (
+    "请改用 B1-1/2/3（帧差能量 / 光流幅值 / 傅里叶频谱）做跨组比较："
+    "它们的门控是外部环境量（Q_interf / Q_motion / Q_calib），"
+    "误差不随被测效应变化，不会产生非随机缺失。"
+)
 
-# px_per_mm 不一致 → 额外拒绝所有 unnormalized 指标（docs/06 T05）
-_UNNORMALIZED_REJECT_RULE = "px_per_mm_ref"
+# 受规则 4 影响的指标（观察窗口径敏感：RR@300s ≠ RR@180s）
+CLEARANCE_LIKE_METRICS: frozenset[str] = frozenset(
+    {"A8_T50", "A9_T90", "A10_T100", "A11_RR", "A13_AUC60", "D3_T_end",
+     "D4_duration"}
+)
 
-_REALIGN_HINT = "重跑对齐约 4 秒（读 cache/detections.jsonl，不重跑检测）"
+# 重跑对齐的成本提示（docs/04 §4.4：拒绝报错必须把用户引向最低成本出路）
+RERUN_HINT = "请用当前版本重新分析上述 run（单段约 4 秒）后再比较。"
 
 
 @dataclass
-class RunRef:
-    """参与比较的一个 run（磁盘 → 内存的只读投影）。
-
-    Attributes:
-        run_id: run 目录名。
-        run_dir: run 目录路径。
-        config: RunConfig（run_config.yaml；缺失时用内置默认 + 告警）。
-        metrics: metric_id → 指标行 dict（17 列冻结 schema；缺失键 = 未输出）。
-        group: 组标签（盲法场景为盲法编号；揭盲后为真实分组）。
-        pond_id: 重复结构声明（伪重复检查用；None = 未声明 → 强制告警）。
-        blind_code: 盲法编号（可 None）。
-        warnings: 加载期告警（绝不静默）。
-    """
+class RunBundle:
+    """参与比较的一个 run 的可比性元数据（不含逐帧数据，轻量）。"""
 
     run_id: str
-    run_dir: Path
     config: RunConfig
-    metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
-    group: str | None = None
-    pond_id: str | None = None
-    blind_code: str | None = None
-    warnings: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)   # metric_id -> 行 dict
+    disabled: set[str] = field(default_factory=set)          # 被关闭的指标 ID
+    quality: dict[str, Any] = field(default_factory=dict)    # Q_* 信号
+    window_s: float | None = None
+    window_truncated: bool = False
+    roi: Any | None = None                                   # ROI 对象（可选）
+    group: str = ""
+    pond_id: str | None = None                               # 重复结构声明（伪重复）
 
-    # ------------------------------------------------------------------
-    @property
-    def label(self) -> str:
-        """对外显示名（盲法优先：不泄露分组）。"""
-        return self.blind_code or self.run_id
-
-    def has(self, metric_id: str) -> bool:
-        return metric_id in self.metrics
-
-    def value_of(self, metric_id: str) -> float | None:
-        """取指标数值；不可用/删失/未输出 → None（绝不用 0 冒充）。"""
+    def value(self, metric_id: str) -> float | None:
+        """取指标数值；不可用/删失 → None（绝不用 0 冒充）。"""
         row = self.metrics.get(metric_id)
         if row is None:
             return None
         v = row.get("value")
-        if v is None or v == "":
+        if v in (None, ""):
             return None
         try:
             return float(v)
         except (TypeError, ValueError):
             return None
 
-    def status_of(self, metric_id: str) -> str:
-        row = self.metrics.get(metric_id)
-        return str(row.get("status", "unavailable")) if row else "unavailable"
+    def status(self, metric_id: str) -> str:
+        row = self.metrics.get(metric_id) or {}
+        return str(row.get("status", "unavailable"))
 
-    def usable_values(self, metric_ids: Iterable[str]) -> dict[str, float]:
-        """批量取可用值（仅 status in ok/degraded 且 value 非空的指标）。"""
-        out: dict[str, float] = {}
-        for mid in metric_ids:
-            if self.status_of(mid) not in ("ok", "degraded"):
-                continue
-            v = self.value_of(mid)
-            if v is not None:
-                out[mid] = v
-        return out
+    def flags(self, metric_id: str) -> set[str]:
+        row = self.metrics.get(metric_id) or {}
+        raw = row.get("flags") or ""
+        return {f for f in str(raw).split(";") if f}
+
+    def available_metrics(self) -> set[str]:
+        """本 run 有可用数值（status ∈ ok/degraded）的指标集。"""
+        return {
+            mid for mid in self.metrics
+            if self.status(mid) in ("ok", "degraded") and self.value(mid) is not None
+        }
 
 
 @dataclass
-class ComparisonResult:
-    """一次比较的输出（拒绝也是输出——列出差异 + 重跑提示）。
+class Rule:
+    """一条比较前一致性规则。"""
 
-    Attributes:
-        ok: 是否通过全部前置校验（False = 未执行任何统计）。
-        plan_name: 比较计划名（'two_group' 等）。
-        rejected_rules: 命中的拒绝规则名（空 = 通过）。
-        differences: 逐条差异描述（字段级粒度，可直接展示给用户）。
-        rejected_metrics: 被额外拒绝的 metric_id（如 px_per_mm 不一致 →
-            unnormalized 指标；空 = 无额外拒绝）。
-        tests: metric_id → 检验结果 dict（由子类填充）。
-        warnings: 非阻断告警（可用集不一致 / 伪重复 / 单池仅描述性）。
-        notes: 口径说明（检验方法选择依据、重复结构说明等）。
-    """
+    rule_id: int
+    name: str
+    action: str            # 'reject_all' | 'reject_metrics' | 'warn'
+    description: str
 
-    ok: bool = False
-    plan_name: str = ""
-    rejected_rules: list[str] = field(default_factory=list)
-    differences: list[str] = field(default_factory=list)
-    rejected_metrics: list[str] = field(default_factory=list)
-    tests: dict[str, dict[str, Any]] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "name": self.name,
+            "action": self.action,
+            "description": self.description,
+        }
+
+
+@dataclass
+class Violation:
+    """一次规则命中。"""
+
+    rule_id: int
+    rule_name: str
+    action: str
+    message: str
+    affected_metrics: list[str] = field(default_factory=list)
+    exit_hint: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rule_id": self.rule_id,
+            "rule_name": self.rule_name,
+            "action": self.action,
+            "message": self.message,
+            "affected_metrics": list(self.affected_metrics),
+            "exit_hint": self.exit_hint,
+        }
+
+
+@dataclass
+class ConsistencyReport:
+    """比较前一致性校验结果。"""
+
+    violations: list[Violation] = field(default_factory=list)
+    rejected_metrics: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """是否允许进行比较（无任何 reject 级命中）。"""
+        return not any(v.action.startswith("reject") for v in self.violations)
+
+    def reject_all(self) -> bool:
+        """是否被拒绝整份比较。"""
+        return any(v.action == "reject_all" for v in self.violations)
+
+    def warnings(self) -> list[Violation]:
+        return [v for v in self.violations if v.action == "warn"]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
-            "plan_name": self.plan_name,
-            "rejected_rules": list(self.rejected_rules),
-            "differences": list(self.differences),
-            "rejected_metrics": list(self.rejected_metrics),
-            "tests": dict(self.tests),
-            "warnings": list(self.warnings),
+            "reject_all": self.reject_all(),
+            "violations": [v.to_dict() for v in self.violations],
+            "rejected_metrics": sorted(self.rejected_metrics),
             "notes": list(self.notes),
         }
 
 
-# ----------------------------------------------------------------------
-# 七条规则校验
-# ----------------------------------------------------------------------
-def _roi_of(cfg: RunConfig) -> Any:
-    """run_config 里的 ROI 指纹（homography + px_per_mm 之外的区域口径）。
-
-    RunConfig 未直接存 ROI 顶点（存 homography + px_per_mm_ref），故 ROI
-    指纹取 run_dir/roi.json（若存在），否则退化为 homography 矩阵比较。
-    """
-    return cfg.homography
-
-
-def check_consistency(
-    refs: Sequence[RunRef],
-    roi_by_run: dict[str, Any] | None = None,
-) -> tuple[list[str], list[str], list[str]]:
-    """七条一致性规则校验（拒绝即返回，不做统计）。
-
-    Args:
-        refs: 参与比较的 run（≥2）。
-        roi_by_run: run_id → ROI 指纹（可序列化的任意结构；None 时用
-            run_config.homography 代替）。
-
-    Returns:
-        (rejected_rules, differences, rejected_metrics)：
-            rejected_rules — 命中的规则名（CONSISTENCY_RULES 的子集 +
-            可能含 'px_per_mm_ref'）；
-            differences — 逐条人类可读差异描述；
-            rejected_metrics — 因 px_per_mm 不一致被额外拒绝的指标。
-    """
-    rejected: list[str] = []
-    differences: list[str] = []
-    rejected_metrics: list[str] = []
-    if len(refs) < 2:
-        return (
-            ["n_runs"],
-            [f"比较至少需要 2 个 run，收到 {len(refs)} 个"],
-            [],
-        )
-
-    base = refs[0]
-    for other in refs[1:]:
-        diffs = base.config.diff(other.config)
-
-        # ---- 1–5 + 7：run_config 字段级 diff 直接映射 ----
-        for rule in CONSISTENCY_RULES:
-            if rule == "roi":
-                continue  # ROI 单独处理（不落在 RunConfig 里）
-            prefix = "thresholds.observation_window_s" if rule == "window_s" else rule
-            if rule == "sampling":
-                prefix = "sampling."
-            hits = [d for d in diffs if d.startswith(prefix)]
-            if hits:
-                if rule not in rejected:
-                    rejected.append(rule)
-                for h in hits:
-                    differences.append(
-                        f"[{rule}] {base.run_id} vs {other.run_id}: {h}"
-                        f"（{RULE_DESCRIPTIONS[rule]}）"
-                    )
-
-        # ---- 6：ROI ----
-        roi_map = roi_by_run or {}
-        a_roi = roi_map.get(base.run_id, _roi_of(base.config))
-        b_roi = roi_map.get(other.run_id, _roi_of(other.config))
-        if a_roi != b_roi:
-            if "roi" not in rejected:
-                rejected.append("roi")
-            differences.append(
-                f"[roi] {base.run_id} vs {other.run_id}: ROI/单应性不一致"
-                f"（{RULE_DESCRIPTIONS['roi']}）"
-            )
-
-        # ---- 附加：px_per_mm 不一致 → 拒绝所有 unnormalized 指标 ----
-        if base.config.px_per_mm_ref != other.config.px_per_mm_ref:
-            if _UNNORMALIZED_REJECT_RULE not in rejected:
-                rejected.append(_UNNORMALIZED_REJECT_RULE)
-            differences.append(
-                f"[px_per_mm_ref] {base.run_id} vs {other.run_id}: "
-                f"{base.config.px_per_mm_ref} != {other.config.px_per_mm_ref}"
-                "：尺度不一致，额外拒绝所有 unnormalized 指标"
-            )
-            for ref in (base, other):
-                for mid, row in ref.metrics.items():
-                    if str(row.get("unit_scale", "")) == "px":
-                        if mid not in rejected_metrics:
-                            rejected_metrics.append(mid)
-
-    if rejected:
-        differences.append(f"修复建议：{_REALIGN_HINT}")
-    return rejected, differences, rejected_metrics
-
-
-# ----------------------------------------------------------------------
-# 加载（磁盘 → RunRef）
-# ----------------------------------------------------------------------
-def load_run_refs(
-    run_dirs: Sequence[str | Path],
-    groups: Sequence[str] | None = None,
-    pond_ids: Sequence[str | None] | None = None,
-    blind_codes: Sequence[str | None] | None = None,
-) -> list[RunRef]:
-    """从 run 目录批量构造 RunRef（读 run_config.yaml + metrics_summary.csv）。
-
-    metrics_summary.csv 缺失 → 该 run 无可用指标（warnings 记录，不静默跳过：
-    空指标集会让"可用集不一致"告警失真）。
-
-    meta.json 提供 pond_id（重复结构）与 group_label_encrypted（盲法编号）。
-    """
-    import csv
-
-    refs: list[RunRef] = []
-    for i, d in enumerate(run_dirs):
-        run_dir = Path(d)
-        warnings: list[str] = []
-        if not run_dir.exists():
-            raise FileNotFoundError(f"run 目录不存在: {run_dir}")
-        cfg_path = run_dir / "run_config.yaml"
-        if cfg_path.exists():
-            config = RunConfig.from_yaml(cfg_path)
-        else:
-            config = RunConfig()
-            warnings.append(
-                "run_config.yaml 缺失：使用内置默认配置"
-                "（七条校验几乎必然不通过）"
-            )
-
-        metrics: dict[str, dict[str, Any]] = {}
-        csv_path = run_dir / "metrics_summary.csv"
-        if csv_path.exists():
-            with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
-                for row in csv.DictReader(fh):
-                    mid = row.get("metric_id")
-                    if mid:
-                        metrics[str(mid)] = dict(row)
-        else:
-            warnings.append(
-                "metrics_summary.csv 缺失：该 run 无可用指标"
-                "（可用集为空，跨组比较的缺失告警将失真）"
-            )
-
-        pond_id: str | None = None
-        blind_code: str | None = None
-        meta_path = run_dir / "meta.json"
-        if meta_path.exists():
-            try:
-                m = json.loads(meta_path.read_text(encoding="utf-8"))
-                if isinstance(m, dict):
-                    pond_id = m.get("pond_id")
-                    blind_code = m.get("blind_code")
-            except json.JSONDecodeError:
-                warnings.append("meta.json 解析失败：重复结构未声明")
-
-        if pond_ids is not None and i < len(pond_ids):
-            pond_id = pond_ids[i]
-        if blind_codes is not None and i < len(blind_codes):
-            blind_code = blind_codes[i]
-        group = groups[i] if groups is not None and i < len(groups) else None
-
-        if pond_id is None:
-            warnings.append(
-                "pond_id 未声明：无法判定重复结构（伪重复风险，"
-                "统计输出将标注为重复结构未知）"
-            )
-
-        refs.append(
-            RunRef(
-                run_id=run_dir.name,
-                run_dir=run_dir,
-                config=config,
-                metrics=metrics,
-                group=group,
-                pond_id=pond_id,
-                blind_code=blind_code,
-                warnings=warnings,
-            )
-        )
-    return refs
-
-
-# ----------------------------------------------------------------------
-# 抽象基类
-# ----------------------------------------------------------------------
-class ComparisonPlan:
+class ComparisonPlan(ABC):
     """比较计划抽象基类（classDiagram ComparisonPlan）。
 
     子类职责：
-        - `validate()`：本计划特有的结构校验（如两组 = 恰好两个组、每组 n≥?）；
-        - `execute(metric_ids)`：逐指标执行检验并填充 ComparisonResult.tests。
+        - validate()：执行七条一致性规则，返回 ConsistencyReport；
+        - execute(metric_id)：逐指标执行统计检验，返回 TestResult；
+        - group_labels()：分组标签（盲法下为盲法编号）。
 
-    基类负责：七条一致性规则（硬门）+ 可用集差异检查 + 伪重复检查 +
-    拒绝时的差异清单与重跑提示。**任何子类都不得跳过基类校验**——
-    这是"不提供强制比较绕过开关"的实现保证：唯一的执行入口 `run()`
-    先跑 `check_consistency`，不通过就直接返回，不调用 `execute()`。
+    设计：两组对照 = TwoGroupPlan 特例；剂量梯度留位（未实现），
+    新增设计只需新增子类，不动七条规则与导出/UI 层。
     """
 
-    name: str = "comparison_plan"
-
-    def __init__(self, refs: Sequence[RunRef]) -> None:
-        self.refs: list[RunRef] = list(refs)
-
-    # ------------------------------------------------------------------
-    def run(
-        self,
-        metric_ids: Sequence[str] | None = None,
-        roi_by_run: dict[str, Any] | None = None,
-    ) -> ComparisonResult:
-        """唯一执行入口：先过七条硬门，通过才调用 execute()。"""
-        result = ComparisonResult(plan_name=self.name)
-        for ref in self.refs:
-            result.warnings.extend(
-                f"[{ref.run_id}] {w}" for w in ref.warnings
-            )
-
-        rejected, differences, rejected_metrics = check_consistency(
-            self.refs, roi_by_run
-        )
-        result.rejected_rules = rejected
-        result.differences = differences
-        result.rejected_metrics = rejected_metrics
-        if rejected:
-            result.ok = False
-            result.notes.append(
-                "一致性校验未通过：未执行任何统计检验"
-                "（不提供强制比较开关——口径不一致时的 p 值是精确的废话）"
-            )
-            result.notes.append(_REALIGN_HINT)
-            return result
-
-        structural = self.validate()
-        if structural:
-            result.ok = False
-            result.differences.extend(structural)
-            result.notes.append("比较计划结构校验未通过：未执行统计检验")
-            return result
-
-        result.ok = True
-        # 把"被额外拒绝的指标"（如 px_per_mm 不一致 → unnormalized）传给
-        # 子类，execute() 内据此把这些指标标为 unavailable，而不是照常出 p 值。
-        self._rejected_metrics = list(rejected_metrics)
-        result.tests = self.execute(metric_ids)
-        return result
-
-    # 被额外拒绝的指标（由 check_consistency 填充；未执行校验时为空）
-    _rejected_metrics: list[str] = []
+    def __init__(self, runs: Sequence[RunBundle]) -> None:
+        if len(runs) < 2:
+            raise ValueError("比较至少需要 2 个 run")
+        self.runs: list[RunBundle] = list(runs)
 
     # ------------------------------------------------------------------
-    def validate(self) -> list[str]:
-        """计划特有的结构校验（返回问题列表，空 = 通过）。子类覆写。"""
+    @abstractmethod
+    def validate(self) -> ConsistencyReport:
+        """比较前一致性校验（七条规则）。"""
         raise NotImplementedError
 
-    def execute(self, metric_ids: Sequence[str] | None = None) -> dict[str, dict[str, Any]]:
-        """执行统计检验（子类实现）。"""
+    @abstractmethod
+    def execute(self, metric_id: str) -> Any:
+        """对单个指标执行统计检验。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def group_labels(self) -> list[str]:
+        """分组标签列表（盲法下为盲法编号）。"""
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # 共用检查（子类在 execute 内调用）
+    # 七条规则的公共实现（子类复用）
     # ------------------------------------------------------------------
-    def check_pseudoreplication(self, result: ComparisonResult) -> None:
-        """伪重复检查（docs/06 §7.11）：同一池塘的多次投喂 ≠ 独立样本。
+    @staticmethod
+    def RULES() -> list[Rule]:
+        return [
+            Rule(1, "px_per_mm 一致性", "reject_metrics",
+                 "px_per_mm 不一致 → 拒绝比较任何带 unnormalized 的指标"),
+            Rule(2, "metrics_spec_version 一致性", "reject_all",
+                 "规范版本不一致 → 拒绝整份比较（阻断清单含义不同）"),
+            Rule(3, "model_md5 一致性", "reject_all",
+                 "模型权重不一致 → 拒绝全部比较（检测行为整体改变）"),
+            Rule(4, "观察窗一致性", "reject_metrics",
+                 "window_s 不一致或任一 run 窗口截断 → 拒绝 RR 与清空时间类"),
+            Rule(5, "ROI 一致性", "warn",
+                 "ROI 面积差>5% 或 IoU<0.95 → 告警（不同养殖单元时本应不同）"),
+            Rule(6, "已关闭指标集一致性", "warn",
+                 "两组可用指标集不同 → 告警（缺失可能非随机）"),
+            Rule(7, "非中立门控缺失", "reject_metrics",
+                 "缺失由非中立门控触发 → 拒绝对可用子集做统计推断"),
+        ]
 
-        单池塘（或 pond_id 缺失）→ 标注"无独立重复，仅描述性，不可做统计
-        推断"；多池塘 → 说明重复结构（MixedLM 随机效应的依据）。
-        """
-        ponds = {r.pond_id for r in self.refs if r.pond_id is not None}
-        n_runs = len(self.refs)
-        if not ponds:
-            result.warnings.append(
-                "重复结构未知（全部 run 均未声明 pond_id）："
-                "无独立重复，仅描述性，不可做统计推断"
-            )
-        elif len(ponds) == 1:
-            result.warnings.append(
-                f"单池塘（pond_id={sorted(ponds)[0]}，{n_runs} 次投喂）："
-                "同一池塘多次投喂属伪重复，仅描述性，不可做统计推断"
-            )
-        else:
-            result.notes.append(
-                f"重复结构：{len(ponds)} 个池塘（{sorted(ponds)}）/ "
-                f"{n_runs} 次投喂 → 采用以 pond 为随机效应的混合模型（MixedLM）"
-            )
-
-    def check_available_set_diff(
-        self, result: ComparisonResult, metric_id: str
+    def _check_config_rules(
+        self, report: ConsistencyReport, metric_ids: Sequence[str]
     ) -> None:
-        """可用集差异检查：两组可用指标集不一致 → 非随机缺失告警。
+        """规则 1–5：配置/ROI 层（与具体统计方法无关）。"""
+        cfgs = [r.config for r in self.runs]
+        base = cfgs[0]
 
-        为什么这是硬告警（docs/04 §4.3 第 4 类）：指标"没输出"往往是因为
-        鱼太活跃（运动模糊 → 跟踪失败），即**缺失本身可能就是效应**。
-        此时比较"算得出来的那些"会系统性低估处理效应。
-        """
-        usable = [r.run_id for r in self.refs if r.status_of(metric_id) in ("ok", "degraded")]
-        missing = [r.run_id for r in self.refs if r.run_id not in usable]
-        if missing and usable:
-            result.warnings.append(
-                f"{metric_id} 可用集不一致：{sorted(usable)} 有值，"
-                f"{sorted(missing)} 不可用——缺失可能是效应本身"
-                "（高摄食强度会降低检测/跟踪质量），跨组比较存在非随机缺失风险"
-            )
+        # ---- 规则 2：metrics_spec_version ----
+        if any(c.metrics_spec_version != base.metrics_spec_version for c in cfgs):
+            report.violations.append(Violation(
+                rule_id=2, rule_name="metrics_spec_version 一致性",
+                action="reject_all",
+                message=(
+                    "参与比较的 run 使用了不同的指标规范版本："
+                    + "、".join(
+                        f"{r.run_id}={r.config.metrics_spec_version}"
+                        for r in self.runs
+                    )
+                    + "。版本不同意味着『什么算阻断』的清单不同，"
+                      "跨批比较会失效。"
+                ),
+                affected_metrics=list(metric_ids),
+                exit_hint=RERUN_HINT,
+            ))
+
+        # ---- 规则 3：model_md5 ----
+        if any((c.model_md5 or "") != (base.model_md5 or "") for c in cfgs):
+            report.violations.append(Violation(
+                rule_id=3, rule_name="model_md5 一致性",
+                action="reject_all",
+                message=(
+                    "参与比较的 run 使用了不同模型权重："
+                    + "、".join(
+                        f"{r.run_id}={r.config.model_md5 or '(空)'}"
+                        for r in self.runs
+                    )
+                    + "。换/重训模型会让检测行为整体改变，几乎所有指标不可比。"
+                ),
+                affected_metrics=list(metric_ids),
+                exit_hint=RERUN_HINT,
+            ))
+
+        # ---- 规则 1：px_per_mm → 拒绝 unnormalized 指标 ----
+        px = {r.config.px_per_mm_ref for r in self.runs}
+        if len(px) > 1:
+            affected = [
+                mid for mid in metric_ids
+                if any("unnormalized" in r.flags(mid) for r in self.runs)
+            ]
+            report.violations.append(Violation(
+                rule_id=1, rule_name="px_per_mm 一致性",
+                action="reject_metrics",
+                message=(
+                    "各 run 的 px_per_mm 不一致（"
+                    + "、".join(
+                        f"{r.run_id}={r.config.px_per_mm_ref}" for r in self.runs
+                    )
+                    + "）：像素口径（unnormalized）指标不可跨视频比较。"
+                ),
+                affected_metrics=affected,
+                exit_hint="完成透视标定后重跑，或改用无量纲指标（如 RR / RP / T50）。",
+            ))
+            report.rejected_metrics.update(affected)
+
+        # ---- 规则 4：观察窗 ----
+        windows = {round(float(r.window_s or 0.0), 6) for r in self.runs}
+        truncated = [r for r in self.runs if r.window_truncated]
+        if len(windows) > 1 or truncated:
+            affected = [mid for mid in metric_ids if mid in CLEARANCE_LIKE_METRICS]
+            if len(windows) > 1:
+                msg = (
+                    "各 run 的观察窗不一致（"
+                    + "、".join(f"{r.run_id}={r.window_s:.0f}s" for r in self.runs)
+                    + "）：RR@300s 与 RR@180s 不是同一个量。"
+                )
+            else:
+                msg = (
+                    "以下 run 的观察窗被截断（< 标称窗长）："
+                    + "、".join(
+                        f"{r.run_id}={r.window_s:.0f}s" for r in truncated
+                    )
+                    + "：截断窗口径与完整窗不可直接比较。"
+                )
+            report.violations.append(Violation(
+                rule_id=4, rule_name="观察窗一致性",
+                action="reject_metrics",
+                message=msg,
+                affected_metrics=affected,
+                exit_hint="延长视频或统一 window_s 后重跑（单段约 4 秒）。",
+            ))
+            report.rejected_metrics.update(affected)
+
+        # ---- 规则 5：ROI（只告警）----
+        rois = [r.roi for r in self.runs if r.roi is not None]
+        if len(rois) >= 2 and hasattr(rois[0], "arena"):
+            if not self._roi_consistent(rois):
+                report.violations.append(Violation(
+                    rule_id=5, rule_name="ROI 一致性", action="warn",
+                    message=(
+                        "各 run 的 ROI 不一致（面积差 > 5% 或 IoU < 0.95）。"
+                        "不同养殖单元时 ROI 本应不同（合法），"
+                        "但归一化类指标会受影响，请人工确认。"
+                    ),
+                    affected_metrics=[],
+                    exit_hint="若属不同养殖单元，此为合法差异，可继续；"
+                              "否则请统一 ROI 后重跑。",
+                ))
+
+    @staticmethod
+    def _roi_consistent(rois: Sequence[Any]) -> bool:
+        """ROI 一致性：arena 面积差 ≤5% 且 IoU ≥0.95（缺失 polygon_area → 保守判为一致）。"""
+        try:
+            import numpy as np
+
+            from src.core.roi import polygon_area
+        except Exception:  # pragma: no cover
+            return True
+
+        def _poly_iou(a: Any, b: Any) -> tuple[float, float]:
+            """(面积比, IoU)——用栅格近似，避免引入 shapely 依赖。"""
+            pts = np.vstack([np.asarray(a, dtype=float),
+                             np.asarray(b, dtype=float)])
+            (x0, y0), (x1, y1) = pts.min(axis=0), pts.max(axis=0)
+            w = h = 128
+            mask_a = np.zeros((h, w), dtype=bool)
+            mask_b = np.zeros((h, w), dtype=bool)
+            for mask, poly in ((mask_a, a), (mask_b, b)):
+                pts_p = np.asarray(poly, dtype=float).copy()
+                pts_p[:, 0] = (pts_p[:, 0] - x0) / max(x1 - x0, 1e-9) * (w - 1)
+                pts_p[:, 1] = (pts_p[:, 1] - y0) / max(y1 - y0, 1e-9) * (h - 1)
+                ys, xs = np.mgrid[0:h, 0:w]
+                inside = np.zeros((h, w), dtype=bool)
+                for i in range(len(pts_p)):
+                    x_a, y_a = pts_p[i]
+                    x_b, y_b = pts_p[(i + 1) % len(pts_p)]
+                    cross = ((xs - x_a) * (y_b - y_a)
+                             - (ys - y_a) * (x_b - x_a))
+                    inside ^= cross > 0
+                mask[:] = inside
+            inter = float(np.count_nonzero(mask_a & mask_b))
+            union = float(np.count_nonzero(mask_a | mask_b))
+            return (inter / max(inter, 1e-9),
+                    inter / union if union > 0 else 0.0)
+
+        base = rois[0]
+        for other in rois[1:]:
+            try:
+                area_a = float(polygon_area(np.asarray(base.arena, dtype=float)))
+                area_b = float(polygon_area(np.asarray(other.arena, dtype=float)))
+            except Exception:  # pragma: no cover
+                continue
+            if abs(area_a - area_b) / max(area_a, area_b, 1e-9) > 0.05:
+                return False
+            try:
+                _ratio, iou = _poly_iou(base.arena, other.arena)
+            except Exception:  # pragma: no cover
+                return True
+            if iou < 0.95:
+                return False
+        return True

@@ -24,3 +24,9 @@ label_studio/
 *.log
 .DS_Store
 Thumbs.db
+
+# 临时产物（docs/06 §7.9）
+_scratch/
+.pytest_tmp/
+*.avi
+*.mp4
