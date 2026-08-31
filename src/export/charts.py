@@ -21,10 +21,31 @@ from pathlib import Path
 from typing import Sequence
 
 import matplotlib
+import matplotlib.font_manager as fm
 
 matplotlib.use("Agg")  # 无显示环境（服务端/批处理）必须
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+
+# 中文图表字体：优先选用系统中已安装的 CJK 字体，避免标题/标注里的中文
+# 渲染成方块（'Glyph X missing from font(s) DejaVu Sans'）。找不到时退回默认
+# 字体（此时中文可能缺字，但不报错，英文/数字正常）。
+_CJK_FONT_CANDIDATES = [
+    "Microsoft YaHei", "Source Han Sans CN", "Noto Sans SC",
+    "SimHei", "WenQuanYi Zen Hei", "SimSun",
+]
+
+
+def _configure_cjk_font() -> None:
+    available = {f.name for f in fm.fontManager.ttflist}
+    chosen = [n for n in _CJK_FONT_CANDIDATES if n in available]
+    if chosen:
+        plt.rcParams["font.family"] = "sans-serif"
+        plt.rcParams["font.sans-serif"] = chosen + ["DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False  # CJK 字体常缺独立减号字形
+
+
+_configure_cjk_font()
 
 __all__ = [
     "SeriesSpec",
@@ -123,7 +144,7 @@ def plot_pellet_curve(
                 label="原生采样点（真实观测）", zorder=2)
     if n0 is not None:
         ax.axhline(float(n0), color="#888888", linestyle=":", linewidth=1.0,
-                   label=f"N₀ = {n0:.0f} 颗")
+                   label=f"N0 = {n0:.0f} 颗")
     for tv, name, color in ((t50, "T50", "#2ca02c"), (t90, "T90", "#ff7f0e")):
         if tv is not None:
             ax.axvline(float(tv), color=color, linestyle="--", linewidth=1.0,
