@@ -40,6 +40,7 @@ from src.export.summary_writer import (
     write_flag_glossary_csv,
     write_summary_json,
 )
+from src.export.xlsx_writer import write_summary_xlsx
 
 __all__ = [
     "SeriesSpec",
@@ -66,4 +67,5 @@ __all__ = [
     "write_capability_report_md",
     "write_flag_glossary_csv",
     "write_summary_json",
+    "write_summary_xlsx",
 ]

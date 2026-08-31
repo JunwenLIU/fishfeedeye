@@ -447,7 +447,7 @@ class TestNonFeedingLoss:
         link = self._link(events)
         tally = tally_vanish(link, [], 300.0, Thresholds())
         assert tally.available
-        mv, q = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
+        mv, q, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
         assert q == pytest.approx(0.20)
         assert mv.value == pytest.approx(20.0)
         assert "contains_non_feeding_loss" in mv.flags  # 0.20 > 0.15
@@ -455,7 +455,7 @@ class TestNonFeedingLoss:
     def test_untracked_unavailable_never_zero(self) -> None:
         tally = tally_vanish(None, [], None, Thresholds())
         assert tally.available is False
-        mv, q = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
+        mv, q, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
         assert mv.status == "unavailable"
         assert mv.value is None
         assert q is None  # 严禁默认为 0
@@ -466,7 +466,7 @@ class TestNonFeedingLoss:
         link = self._link(events)
         tally = tally_vanish(link, [], 300.0, Thresholds())  # 300 > a14_window 60
         assert tally.partial_window
-        _, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
+        _, _, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
 
 
 # ----------------------------------------------------------------------
@@ -537,6 +537,17 @@ class TestQualitySignals:
         link = LinkResult(tracks=[], vanish_events=[], n_eaten=0, n_drifted=30, n_unknown=0)
         signals = QualitySignals().compute([], link_result=link, n0_det=100.0)
         assert signals["Q_pelletloss"] == pytest.approx(0.30)
+
+    def test_q_fatelost_includes_unknown(self) -> None:
+        from src.pipeline.pellet_linker import LinkResult
+
+        # 漂出 10 + 命运未确认 10，N0=100 → Q_fatelost=0.20，Q_pelletloss=0.10
+        link = LinkResult(
+            tracks=[], vanish_events=[], n_eaten=0, n_drifted=10, n_unknown=10
+        )
+        signals = QualitySignals().compute([], link_result=link, n0_det=100.0)
+        assert signals["Q_pelletloss"] == pytest.approx(0.10)
+        assert signals["Q_fatelost"] == pytest.approx(0.20)
 
     def test_q_n0gap_requires_both_tracks(self) -> None:
         signals = QualitySignals().compute([], n0_det=100.0)

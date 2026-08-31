@@ -191,7 +191,7 @@ class TestUnavailableHasReason:
 
     def test_a14_untracked_reason_declares_uncorrected(self) -> None:
         tally = tally_vanish(None, [], None, Thresholds())
-        mv, q = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
+        mv, q, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
         assert mv.status == "unavailable"
         assert mv.value is None
         assert q is None  # 严禁默认 0
@@ -245,7 +245,7 @@ class TestA14UnavailableNoContradiction:
     def test_unavailable_a14_yields_unverifiable_not_contradiction(self) -> None:
         # 真实数据流：link=None → tally 不可用 → q_pelletloss=None
         tally = tally_vanish(None, [], None, Thresholds())
-        _mv, q = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
+        _mv, q, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
         assert q is None
         meta = RunMeta(pellet_type="floating")
         report = apply_capability(
@@ -363,7 +363,7 @@ class TestOverridesLeaveTrace:
         tally = tally_vanish(link, [], 300.0, Thresholds())
         assert tally.available
         assert tally.partial_window  # 300s > a14_window_s=60 → 显式标注
-        mv, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
+        mv, _, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
         assert "partial_window" in mv.flags
 
 

@@ -16,6 +16,7 @@ from typing import Any
 import gradio as gr
 
 from src.app.state import ProjectState, VideoEntry
+from src.core.checklists import FR03_ITEMS, FR35_ITEMS
 
 __all__ = ["build_project_page"]
 
@@ -162,4 +163,50 @@ def build_project_page(state: ProjectState) -> gr.components.Component:
         hide_btn.click(_on_hide, [operator_tb], [table, status_md])
         save_btn.click(_on_save, [], [status_md])
         table.value = state.table_rows()
+
+        # ---- FR-03 / FR-35 清单（科学信度支柱，PRD §4.1.1 / §4.1.5）----
+        with gr.Tabs():
+            _build_checklist_tab(
+                state, "fr03", FR03_ITEMS,
+                "### 拍摄规范清单（FR-03）\n"
+                "逐条确认拍摄是否达标。**未勾选的条目会在每份分析报告中列为"
+                "『已知采集偏差』**——这是披露纪律，默认全部未勾选，须主动确认。",
+            )
+            _build_checklist_tab(
+                state, "fr35", FR35_ITEMS,
+                "### 实验设计检查清单（FR-35）\n"
+                "诱食剂实验设计规范。**勾选状态会写入每份分析报告**，"
+                "供审稿人判断实验设计是否站得住。",
+            )
     return page
+
+
+def _build_checklist_tab(
+    state: ProjectState, group: str, items: Any, intro: str
+) -> None:
+    """构建单个清单页签（FR-03 或 FR-35）；逐条展示 why/consequence 可勾选。"""
+    with gr.Tab("拍摄规范清单 (FR-03)" if group == "fr03" else "实验设计清单 (FR-35)"):
+        gr.Markdown(intro)
+        status = gr.Markdown("")
+        for it in items:
+            checked = (
+                state.checklists.fr03.get(it.id, False)
+                if group == "fr03"
+                else state.checklists.fr35.get(it.id, False)
+            )
+            with gr.Row():
+                ck = gr.Checkbox(label=it.label, value=bool(checked), scale=1)
+                gr.Markdown(
+                    f"**为什么**：{it.rationale}\n\n"
+                    f"**做不到会怎样**：{it.consequence}",
+                    scale=3,
+                )
+
+            def _on_change(val: bool, g: str = group, iid: str = it.id) -> str:
+                state.set_checklist(g, iid, bool(val))
+                return (
+                    f"已保存：{iid} = "
+                    f"{'满足' if val else '未勾选 → 已知采集偏差（报告将披露）'}"
+                )
+
+            ck.change(_on_change, [ck], [status])

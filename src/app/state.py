@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.core.checklists import ChecklistsState
+
 __all__ = [
     "VideoEntry",
     "ProjectState",
@@ -90,6 +92,7 @@ class ProjectState:
         self.runs_root: Path = Path(__file__).resolve().parents[2] / "runs"
         self.blind_map_path: Path = self.project_dir / "blind_map.enc"
         self.audit_log_path: Path = self.project_dir / "audit_log.jsonl"
+        self.checklists: ChecklistsState = ChecklistsState.default()
         self._load()
 
     # ------------------------------------------------------------------
@@ -183,6 +186,7 @@ class ProjectState:
         self.revealed = bool(d.get("revealed", False))
         self.runs_root = Path(d.get("runs_root") or self.runs_root)
         self.videos = [VideoEntry.from_dict(v) for v in d.get("videos") or []]
+        self.checklists = ChecklistsState.from_dict(d.get("checklists"))
         if self.audit_log_path.exists():
             for line in self.audit_log_path.read_text(
                 encoding="utf-8"
@@ -205,6 +209,7 @@ class ProjectState:
                     "revealed": self.revealed,
                     "runs_root": str(self.runs_root),
                     "videos": [v.to_dict() for v in self.videos],
+                    "checklists": self.checklists.to_dict(),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -213,6 +218,16 @@ class ProjectState:
         )
         self.save_blind_map()
         return p
+
+    # ------------------------------------------------------------------
+    def set_checklist(self, group: str, item_id: str, checked: bool) -> None:
+        """勾选/取消勾选 FR-03/FR-35 清单条目（改动即落盘 + 写审计日志）。"""
+        self.checklists.set_item(group, item_id, checked)
+        self.save()
+        self.log(
+            "checklist",
+            f"{group}.{item_id} → {'已勾选（满足）' if checked else '未勾选（已知采集偏差）'}",
+        )
 
     # ------------------------------------------------------------------
     def table_rows(self, include_group: bool = False) -> list[list[str]]:

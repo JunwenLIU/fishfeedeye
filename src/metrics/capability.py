@@ -366,15 +366,18 @@ def apply_capability(
             "仅加 sedimentation_risk_unassessed 标记（保守分支）"
         )
 
-    # ---- ③ 漂出率 > 15%（team-lead 派单三规则之二）----
-    q_pelletloss = q.get("Q_pelletloss")
-    if q_pelletloss is not None and q_pelletloss > thresholds.pelletloss_degrade:
+    # ---- ③ 命运未确认率 > 15%（PRD FR-14：n_drifted + n_unknown > 15%）----
+    # 优先用 Q_fatelost（漂出 + 反光区消失），缺失时回退到已知非摄食损失率
+    loss_rate = q.get("Q_fatelost")
+    if loss_rate is None:
+        loss_rate = q.get("Q_pelletloss")
+    if loss_rate is not None and loss_rate > thresholds.pelletloss_degrade:
         for mid in ("A9_T90", "A10_T100", "A11_RR"):
             _flag(mid, "contains_non_feeding_loss")
             _degrade(
                 mid,
-                f"Q_pelletloss = {q_pelletloss:.1%} > "
-                f"{thresholds.pelletloss_degrade:.0%}（漂出/沉降损失），"
+                f"命运未确认率 = {loss_rate:.1%} > "
+                f"{thresholds.pelletloss_degrade:.0%}（漂出/反光区消失），"
                 "降级为参考值（须与 A14 并列展示）",
             )
 
@@ -387,19 +390,19 @@ def apply_capability(
     #       标 sedimentation_risk_unverifiable，**不覆盖用户声明**，
     #       告警文案不得出现"实测"字样（此时没有实测证据，只有不可测）。
     if pellet_type == "floating":
-        if q_pelletloss is not None and q_pelletloss > thresholds.pelletloss_degrade:
+        if loss_rate is not None and loss_rate > thresholds.pelletloss_degrade:
             for mid in ("A9_T90", "A10_T100", "A11_RR"):
                 _flag(mid, "metadata_contradiction")
             report.notes.append(
-                "矛盾（以实测为准）：用户声明浮性料，但实测 Q_pelletloss 超阈"
-                "——沉降与摄食不可分的风险实际存在，已按实测口径标注"
-                " contains_non_feeding_loss + metadata_contradiction"
+                "矛盾（以实测为准）：用户声明浮性料，但实测命运未确认率超阈"
+                "（含漂出与反光区消失）——沉降与摄食不可分的风险实际存在，"
+                "已按实测口径标注 contains_non_feeding_loss + metadata_contradiction"
             )
-        elif q_pelletloss is None:
+        elif loss_rate is None:
             for mid in ("A9_T90", "A10_T100"):
                 _flag(mid, "sedimentation_risk_unverifiable")
             report.notes.append(
-                "Q_pelletloss 不可测（颗粒轨迹未关联，A14 不可用）：浮性料的"
+                "命运未确认率不可测（颗粒轨迹未关联，A14 不可用）：浮性料的"
                 "沉降风险无法验证（sedimentation_risk_unverifiable），"
                 "不覆盖用户声明，请结合无鱼纯饲料视频复核"
             )

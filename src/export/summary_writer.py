@@ -100,14 +100,38 @@ def render_capability_report_md(
     warnings: Sequence[str],
     notes: Sequence[str],
     metric_rows: Sequence[dict[str, Any]] = (),
+    checklists: Any | None = None,
 ) -> str:
     """渲染 capability_report.md（人类可读；关闭清单为强制章节）。"""
+    from src.core.checklists import ChecklistsState
+
     lines: list[str] = []
     lines.append(f"# 指标能力报告 · {run_id}")
     lines.append("")
     lines.append(f"- 指标规范版本 `metrics_spec_version`: **{metrics_spec_version}**")
     lines.append("- 本报告由 `src/export/summary_writer.py` 生成（可复现）")
     lines.append("")
+
+    # ---- 0. 已知采集偏差（FR-03 未勾选项）+ 实验设计清单（FR-35）----
+    if isinstance(checklists, ChecklistsState):
+        lines.append("## 0. 采集偏差与实验设计（FR-03 / FR-35）")
+        lines.append("")
+        lines.append("### 0.1 已知采集偏差（FR-03 未勾选条目）")
+        lines.append("")
+        lines.append(checklists.collection_bias_markdown())
+        lines.append("")
+        lines.append("### 0.2 实验设计检查清单（FR-35 勾选状态）")
+        lines.append("")
+        lines.append(checklists.design_checklist_markdown())
+        lines.append("")
+    else:
+        lines.append("## 0. 采集偏差与实验设计（FR-03 / FR-35）")
+        lines.append("")
+        lines.append(
+            "本次运行未关联拍摄规范/实验设计清单（checklists 未提供）。"
+            "**未披露采集偏差 ≠ 无偏差**——若用于论文，请在项目页补全清单。"
+        )
+        lines.append("")
 
     # ---- ① 本组因何原因未输出哪些指标（强制，绝不静默省略）----
     lines.append("## 1. 未输出的指标及原因（强制列出）")
@@ -211,6 +235,7 @@ def write_capability_report_md(
     warnings: Sequence[str],
     notes: Sequence[str],
     metric_rows: Sequence[dict[str, Any]] = (),
+    checklists: Any | None = None,
 ) -> Path:
     """写 capability_report.md。"""
     path = Path(path)
@@ -224,6 +249,7 @@ def write_capability_report_md(
             warnings=warnings,
             notes=notes,
             metric_rows=metric_rows,
+            checklists=checklists,
         ),
         encoding="utf-8",
     )

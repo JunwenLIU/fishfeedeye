@@ -117,6 +117,9 @@ def run_batch(
             cal = json.loads(cal_path.read_text(encoding="utf-8"))
             if cal.get("px_per_mm_ref"):
                 cfg.px_per_mm_ref = float(cal["px_per_mm_ref"])
+            # FR-38：浮动投喂框布设状态（None = 未记录，保留未知语义）
+            if "feedbox_deployed" in cal and cal["feedbox_deployed"] is not None:
+                cfg.feedbox_deployed = bool(cal["feedbox_deployed"])
         if calib is not None and calib.association_radius_px:
             cfg.thresholds.association_radius_px = float(
                 calib.association_radius_px
@@ -145,7 +148,10 @@ def run_batch(
             )
             entry.run_id = result.run_id
             if meta is not None:
-                report = compute_run_metrics(result, roi=roi, outdoor=outdoor)
+                report = compute_run_metrics(
+                    result, roi=roi, outdoor=outdoor,
+                    checklists=state.checklists,
+                )
                 write_run_outputs(report, result.run_dir)
                 (result.run_dir / "meta.json").write_text(
                     json.dumps(meta.to_dict(), ensure_ascii=False, indent=2),

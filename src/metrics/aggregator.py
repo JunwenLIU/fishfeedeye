@@ -43,13 +43,16 @@ from __future__ import annotations
 import csv
 import dataclasses
 import json
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 
+from src.core.checklists import ChecklistsState
 from src.core.config import RunConfig, Thresholds
+from src.metrics.t0_detect import detect_first_pellet_s, deviation_alert
 from src.core.frame_context import (
     BaselineStats,
     FishDetections,
@@ -215,6 +218,10 @@ class MetricsReport:
     window_truncated: bool = False
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # FR-03/FR-35 清单状态（项目级快照；None = 未提供，报告中不强行编造）
+    checklists: ChecklistsState | None = None
+    # FR-08：t0 自动检测到的"首颗饲料入画"相对时刻（相对当前 t0 的偏移，秒）
+    t0_auto_detect_s: float | None = None
 
     # ------------------------------------------------------------------
     def by_group(self, group: str) -> dict[str, MetricValue]:
@@ -272,6 +279,17 @@ class MetricsReport:
             ),
             "warnings": list(self.warnings),
             "notes": list(self.notes),
+            # FR-03/FR-35：已知采集偏差 + 实验设计清单状态（None 时仅置空，不编造）
+            "known_collection_bias": (
+                [] if self.checklists is None
+                else self.checklists.collection_bias_rows()
+            ),
+            "design_checklist": (
+                [] if self.checklists is None
+                else self.checklists.design_checklist_rows()
+            ),
+            # FR-08：t0 自动检测结果（None = 无颗粒或不可检测）
+            "t0_auto_detect_s": self.t0_auto_detect_s,
         }
 
 
@@ -481,6 +499,7 @@ class _CoreResult:
     t50: float | None = None
     q_n0gap: float | None = None
     q_pelletloss: float | None = None
+    q_fatelost: float | None = None
     q_censored: bool = False
     fa_dynamic_range: float | None = None
     activity: ActivityResult | None = None
@@ -581,13 +600,15 @@ def _compute_core(
     # ---- A14 非摄食损失（先于清空时间：Q_pelletloss 是其硬输入）----
     tally = tally_vanish(link_result, obs_sorted, t_max_s, th)
     bottom_band_defined = roi is not None and roi.bottom_band is not None
-    a14_mv, q_pelletloss = nonfeeding_loss_metric(
+    a14_mv, q_pelletloss, q_fatelost = nonfeeding_loss_metric(
         tally, n0 if n0 is not None else 0.0,
         bottom_band_defined=bottom_band_defined, thresholds=th,
     )
     res.metrics["A14_NonFeedingLoss"] = a14_mv
     res.q_pelletloss = q_pelletloss
+    res.q_fatelost = q_fatelost
     q_base["Q_pelletloss"] = q_pelletloss
+    q_base["Q_fatelost"] = q_fatelost
 
     # ---- A8/A9/A10 清空时间 ----
     t50_raw: float | None = None
@@ -830,6 +851,7 @@ class MetricsAggregator:
         outdoor: bool = False,
         extra_quality: dict[str, Any] | None = None,
         run_id: str | None = None,
+        checklists: ChecklistsState | None = None,
     ) -> MetricsReport:
         """执行全量指标计算（A + B1 + B2 + D + quality + capability + 双轨）。
 
@@ -849,6 +871,18 @@ class MetricsAggregator:
         meta = meta if meta is not None else RunMeta()
         obs_list = list(observations)
         obs_sorted = sorted(obs_list, key=lambda o: o.t_s)
+
+        # ---- 可复现性：固定随机种子（NFR-05）----
+        # 任何随机步骤（图表抖动、采样、NMS 等）须消费 run_config.seed，
+        # 保证同一份输入在同种子下输出完全一致。
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        try:
+            from src.export import charts as _charts
+
+            _charts.set_chart_seed(self.config.seed)
+        except Exception:
+            pass
         warnings: list[str] = []
         notes: list[str] = []
         th = self.th
@@ -894,6 +928,8 @@ class MetricsAggregator:
         )
         if core.q_pelletloss is not None:
             signals["Q_pelletloss"] = core.q_pelletloss
+        if core.q_fatelost is not None:
+            signals["Q_fatelost"] = core.q_fatelost
         if core.q_n0gap is not None:
             signals["Q_n0gap"] = core.q_n0gap
         signals["Q_censored"] = bool(core.q_censored)
@@ -948,6 +984,41 @@ class MetricsAggregator:
             warnings.append(
                 "pellet_type 未确认：T 系列标记 sedimentation_risk_unassessed"
                 "（未确认元数据只加标记，不关闭）"
+            )
+        # ---- FR-08：t0 自动检测与人工打点偏差告警 ----
+        t0_auto = detect_first_pellet_s(
+            [
+                (o.t_s, o.pellets.n_det() if o.pellets is not None else 0)
+                for o in obs_sorted
+            ]
+        )
+        if t0_auto is not None:
+            msg = deviation_alert(t0_auto)
+            if msg:
+                warnings.append(msg)
+        if self.config.t0_source == "auto":
+            if t0_auto is not None:
+                notes.append(
+                    f"t0_source=auto：自动检测到首颗饲料入画于相对 "
+                    f"{t0_auto:+.1f}s 处（口径=首颗入画，对 feeder_start/"
+                    f"pellet_released 这类画面外事件仅为近似）；指标时间轴"
+                    f"以视频首帧为 t0，建议与 manual 交叉验证"
+                )
+            else:
+                notes.append(
+                    "t0_source=auto：但未检测到任何颗粒，无法自动标定 t0"
+                )
+        # ---- FR-38：浮动投喂框部署状态披露 ----
+        if self.config.feedbox_deployed is False:
+            warnings.append(
+                "未布设浮动投喂框（feedbox_deployed=False）：颗粒更易漂出 ROI，"
+                "漂出类指标（A14 等）应标注为参考值，建议复测时布设投喂框"
+            )
+            notes.append("未使用投喂框，漂出风险高（FR-38 披露）")
+        elif self.config.feedbox_deployed is None:
+            notes.append(
+                "feedbox_deployed 未记录（未确认是否布设浮动投喂框）；"
+                "漂出风险未知，审稿人问起须如实说明"
             )
         warnings.extend(core.activity.warnings)
 
@@ -1007,6 +1078,8 @@ class MetricsAggregator:
             window_truncated=truncated,
             warnings=warnings,
             notes=notes,
+            checklists=checklists,
+            t0_auto_detect_s=t0_auto,
         )
 
 
@@ -1056,6 +1129,7 @@ def compute_run_metrics(
     baseline: BaselineStats | None = None,
     tracks: Tracks | None = None,
     outdoor: bool = False,
+    checklists: ChecklistsState | None = None,
 ) -> MetricsReport:
     """从 Orchestrator.RunResult 聚合指标（含 corrections 消费）。
 
@@ -1090,6 +1164,7 @@ def compute_run_metrics(
         outdoor=outdoor,
         extra_quality=extra_quality or None,
         run_id=run_result.run_id,
+        checklists=checklists,
     )
 
 
@@ -1115,6 +1190,7 @@ def compute_metrics_from_run_dir(
     tracks: Tracks | None = None,
     outdoor: bool = False,
     meta: RunMeta | None = None,
+    checklists: ChecklistsState | None = None,
 ) -> MetricsReport:
     """run 目录 → 完整指标报告（T05 UI 消费的单次调用入口）。
 
@@ -1153,6 +1229,16 @@ def compute_metrics_from_run_dir(
         observations = apply_manual_counts(observations, corrections, inplace=False)
     if meta is None:
         meta = _meta_from_json(run_dir / "meta.json")
+    # FR-03/FR-35：未显式传入时，尝试从 run 目录的 checklists.json 还原
+    if checklists is None:
+        cl_path = run_dir / "checklists.json"
+        if cl_path.exists():
+            try:
+                checklists = ChecklistsState.from_dict(
+                    json.loads(cl_path.read_text(encoding="utf-8"))
+                )
+            except Exception:
+                checklists = None
     if baseline is None:
         baseline = build_baseline_stats(observations, roi)
 
@@ -1167,6 +1253,7 @@ def compute_metrics_from_run_dir(
         px_per_mm=config.px_per_mm_ref,
         outdoor=outdoor,
         run_id=run_dir.name,
+        checklists=checklists,
     )
     if missing_cfg:
         report.warnings.append(
@@ -1272,6 +1359,37 @@ def write_run_outputs(report: MetricsReport, run_dir: str | Path) -> list[Path]:
         encoding="utf-8",
     )
     written.append(p)
+
+    # ---- metrics_summary.xlsx（FR-32 多 sheet 工作簿）----
+    from src.export import xlsx_writer
+
+    written.append(xlsx_writer.write_summary_xlsx(report, run_dir))
+
+    # ---- checklists.json（FR-03/FR-35 状态留档，随 run 复现）----
+    if report.checklists is not None:
+        p = run_dir / "checklists.json"
+        p.write_text(
+            json.dumps(report.checklists.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        written.append(p)
+
+    # ---- capability_report.md（含已知采集偏差 + 实验设计清单章节）----
+    from src.export.summary_writer import write_capability_report_md
+
+    written.append(
+        write_capability_report_md(
+            run_dir / "capability_report.md",
+            run_id=report.run_id or run_dir.name,
+            metrics_spec_version=report.config.metrics_spec_version,
+            quality_table=report.quality_table,
+            capability=report.capability,
+            warnings=report.warnings,
+            notes=report.notes,
+            metric_rows=report.summary_rows(),
+            checklists=report.checklists,
+        )
+    )
     return written
 
 

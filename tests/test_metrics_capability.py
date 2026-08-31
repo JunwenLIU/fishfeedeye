@@ -118,12 +118,26 @@ class TestPelletLossRule:
         for mid in ("A9_T90", "A10_T100", "A11_RR"):
             assert "contains_non_feeding_loss" in rpt.metric_flags.get(mid, [])
             assert mid in rpt.degrade_reasons
-            assert "Q_pelletloss" in rpt.degrade_reasons[mid]
+            assert "命运未确认率" in rpt.degrade_reasons[mid]
 
     def test_pelletloss_below_threshold_no_action(self) -> None:
         rpt = apply_capability(signals(Q_pelletloss=0.05), Thresholds())
         for mid in ("A9_T90", "A10_T100", "A11_RR"):
             assert mid not in rpt.degrade_reasons
+
+    def test_fatelost_unknown_inclusive_drives_degrade(self) -> None:
+        # PRD FR-14：命运未确认率 = (漂出 + 反光区消失)/N0 驱动降级，
+        # 即使已知非摄食损失率(Q_pelletloss)偏低
+        rpt = apply_capability(
+            signals(Q_pelletloss=0.05, Q_fatelost=0.25), Thresholds()
+        )
+        for mid in ("A9_T90", "A10_T100", "A11_RR"):
+            assert "contains_non_feeding_loss" in rpt.metric_flags.get(mid, [])
+            assert mid in rpt.degrade_reasons
+        # 仅 unknown 高、已知漂出低时不应仅凭 Q_pelletloss 触发
+        rpt2 = apply_capability(signals(Q_pelletloss=0.05), Thresholds())
+        for mid in ("A9_T90", "A10_T100", "A11_RR"):
+            assert mid not in rpt2.degrade_reasons
 
 
 class TestPelletTypeRule:

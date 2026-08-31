@@ -1,4 +1,4 @@
-"""13 个 Q_* 全局质量信号（T04，docs/04 §2）。
+"""14 个 Q_* 全局质量信号（T04，docs/04 §2）。
 
 职责：
     每次运行必算、必输出——即使值为 None 也要有行（None = 未测得，
@@ -35,7 +35,7 @@ from src.pipeline.pellet_linker import LinkResult
 
 __all__ = ["QualitySignals", "Q_KEYS", "Q_SIGNAL_KEYS", "to_quality_rows"]
 
-# 13 个质量信号键（docs/04 §2 表格顺序）
+# 14 个质量信号键（docs/04 §2 表格顺序）
 Q_KEYS: tuple[str, ...] = (
     "Q_det",          # 颗粒检测置信度中位数
     "Q_fdet",         # 鱼体检测置信度中位数
@@ -46,7 +46,8 @@ Q_KEYS: tuple[str, ...] = (
     "Q_fg",           # 前景像素占比（须排除 pellet_zone，pipeline 侧）
     "Q_calib",        # 标定可用性（bool）
     "Q_baseline",     # 基线可用性（bool）
-    "Q_pelletloss",   # 非摄食损失率（A14 产出）
+    "Q_pelletloss",   # 已知非摄食损失率（A14 产出：n_drifted/N₀）
+    "Q_fatelost",     # 命运未确认率（A14 产出：(n_drifted+n_unknown)/N₀，驱动降级）
     "Q_n0gap",        # N₀ 交叉校验偏差（A1 产出）
     "Q_censored",     # 右删失标记（aggregator 回填）
     "Q_motion",       # 相机稳定性（配准残差）
@@ -138,7 +139,7 @@ class QualitySignals:
         signals["Q_calib"] = px_per_mm is not None
         signals["Q_baseline"] = baseline is not None and baseline.ok
 
-        # ---- Q_pelletloss：非摄食损失率（A14；n0 缺失 → None）----
+        # ---- Q_pelletloss / Q_fatelost：非摄食损失率（A14；n0 缺失 → None）----
         if (
             link_result is not None
             and n0_det is not None
@@ -147,8 +148,13 @@ class QualitySignals:
             signals["Q_pelletloss"] = float(link_result.n_drifted) / float(
                 n0_det
             )
+            # PRD FR-14：命运未确认率 = (漂出 + 反光区消失)/N₀，驱动降级
+            signals["Q_fatelost"] = float(
+                link_result.n_drifted + link_result.n_unknown
+            ) / float(n0_det)
         else:
             signals["Q_pelletloss"] = None
+            signals["Q_fatelost"] = None
 
         # ---- Q_n0gap：N₀ 双轨交叉校验 ----
         if n0_det is not None and n0_meta is not None and n0_meta > 0:

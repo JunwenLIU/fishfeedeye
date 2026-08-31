@@ -125,12 +125,16 @@ def nonfeeding_loss_metric(
     n0: float,
     bottom_band_defined: bool = False,
     thresholds: Thresholds | None = None,
-) -> tuple[MetricValue, float | None]:
-    """A14 输出 + Q_pelletloss（非摄食损失率）。
+) -> tuple[MetricValue, float | None, float | None]:
+    """A14 输出 + Q_pelletloss（已知非摄食损失率）+ Q_fatelost（命运未确认率）。
 
     Returns:
-        (MetricValue A14, Q_pelletloss)：Q_pelletloss = n_loss/N₀；
-        A14 不可用时 Q_pelletloss = None（不猜测，不得 0 冒充）。
+        (MetricValue A14, Q_pelletloss, Q_fatelost)：
+        - Q_pelletloss = n_loss/N₀（已知漂出损失，用于展示与元数据反查）；
+        - Q_fatelost  = (n_loss + n_unknown)/N₀（漂出 + 反光区消失等命运未确认，
+          驱动 T90/T100/RR 降级与矛盾标记，对应 PRD FR-14 的
+          “n_drifted + n_unknown > 15%” 触发条件）；
+        A14 不可用时二者均为 None（不猜测，不得 0 冒充）。
     """
     th = thresholds if thresholds is not None else Thresholds()
     quality: dict[str, Any] = {
@@ -158,6 +162,7 @@ def nonfeeding_loss_metric(
                 unit_scale="none",
             ),
             None,
+            None,
         )
 
     if n0 is None or n0 <= 0:
@@ -173,11 +178,18 @@ def nonfeeding_loss_metric(
                 unit_scale="none",
             ),
             None,
+            None,
         )
 
-    ratio = tally.n_loss / float(n0)
-    q_pelletloss: float | None = ratio  # Q_pelletloss 同口径
-    if ratio is not None and ratio > th.pelletloss_degrade:
+    ratio = tally.n_loss / float(n0)  # 已知非摄食损失率（Q_pelletloss）
+    # PRD FR-14：降级/矛盾触发以「命运未确认率」为准 = (漂出 + 反光区消失)/N₀
+    ratio_fatelost = (tally.n_loss + tally.n_unknown) / float(n0)
+    q_pelletloss: float | None = ratio
+    q_fatelost: float | None = ratio_fatelost
+    if (
+        ratio_fatelost is not None
+        and ratio_fatelost > th.pelletloss_degrade
+    ):
         flags.append("contains_non_feeding_loss")
     return (
         MetricValue(
@@ -191,4 +203,5 @@ def nonfeeding_loss_metric(
             unit_scale="none",
         ),
         q_pelletloss,
+        q_fatelost,
     )

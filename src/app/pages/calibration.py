@@ -173,7 +173,7 @@ def build_calibration_page(state: ProjectState) -> gr.components.Component:
             out.write_text(json.dumps(
                 {"px_per_mm_ref": px_per_mm, "method": (
                     "homography_4pt" if choice.startswith("有") else "reference_2pt"
-                )},
+                ), "feedbox_deployed": choice.startswith("有")},
                 ensure_ascii=False, indent=2,
             ), encoding="utf-8")
             state.log("calibrate", f"px_per_mm={px_per_mm:.4f}（{out.name}）")
@@ -201,9 +201,33 @@ def build_calibration_page(state: ProjectState) -> gr.components.Component:
                 "（不同定义的两批数据不可直接比较）。"
             )
 
+        def _on_feedbox(choice: str) -> str:
+            """单选"有无投喂框"即持久化 feedbox_deployed（FR-38 数据源）。"""
+            deployed = choice.startswith("有")
+            state.project_dir.mkdir(parents=True, exist_ok=True)
+            out = state.project_dir / "calibration.json"
+            data: dict = {}
+            if out.exists():
+                try:
+                    data = json.loads(out.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data["feedbox_deployed"] = deployed
+            out.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            state.log("calibrate", f"feedbox_deployed={deployed}")
+            return (
+                f"已记录浮动投喂框布设状态："
+                f"{'已布设' if deployed else '未布设'}（写入 `{out.name}`；"
+                f"未布设时报告将标注『漂出风险高』）"
+            )
+
         # ------------------------------------------------------------------
         load_btn.click(_on_load, [video_tb, frame_no], [calib_img, calib_out])
         has_frame_rd.change(_on_toggle, [has_frame_rd], [frame_row, ref_row])
+        has_frame_rd.change(_on_feedbox, [has_frame_rd], [calib_out])
         fit_btn.click(
             _on_fit,
             [has_frame_rd, c1, c2, c3, c4, fw, fh, p1, p2, ref_len],

@@ -163,7 +163,7 @@ class TestUnavailableAlwaysExplained:
 class TestA14ClaimDiscipline:
     def test_untracked_loss_no_corrected_claim(self) -> None:
         tally = tally_vanish(None, [], None, Thresholds())
-        mv, q = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
+        mv, q, _ = nonfeeding_loss_metric(tally, 100.0, True, Thresholds())
         assert mv.status == "unavailable"
         assert mv.reason is not None
         # 必须显式声明"未校正"，且绝不出现"已校正"式话术

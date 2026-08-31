@@ -125,6 +125,12 @@ class RunConfig:
     homography: list[float] | None = None
     px_per_mm_ref: float | None = None
     pellet_type: str = "floating"
+    # 随机种子（NFR-05）：固定并随 run_config.yaml 留档，保证可复现。
+    # 任何随机步骤（图表抖动、采样、NMS 等）须消费此种子。
+    seed: int = 0
+    # 是否布设浮动投喂框（FR-38）：False = 未布设（颗粒更易漂出 ROI，
+    # 漂出类指标应标注为参考值）；None = 未记录（未知，须披露）。
+    feedbox_deployed: bool | None = None
 
     # ------------------------------------------------------------------
     # 序列化
@@ -140,6 +146,8 @@ class RunConfig:
             "homography": self.homography,
             "px_per_mm_ref": self.px_per_mm_ref,
             "pellet_type": self.pellet_type,
+            "seed": self.seed,
+            "feedbox_deployed": self.feedbox_deployed,
         }
 
     @classmethod
@@ -154,6 +162,8 @@ class RunConfig:
             homography=d.get("homography"),
             px_per_mm_ref=d.get("px_per_mm_ref"),
             pellet_type=d.get("pellet_type", "floating"),
+            seed=int(d.get("seed", 0)),
+            feedbox_deployed=d.get("feedbox_deployed", None),
         )
 
     def to_yaml(self, path: str | Path) -> None:
@@ -233,6 +243,8 @@ class RunConfig:
             problems.append(f"t0_source 非法: {self.t0_source!r}")
         if self.pellet_type not in ("floating", "sinking", "slow-sinking", "unknown"):
             problems.append(f"pellet_type 非法: {self.pellet_type!r}")
+        if not isinstance(self.seed, int):
+            problems.append(f"seed 必须为整数: {self.seed!r}")
         if self.homography is not None and len(self.homography) != 9:
             problems.append("homography 必须为 3x3 展平的 9 元素列表")
         s = self.sampling

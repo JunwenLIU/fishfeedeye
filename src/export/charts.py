@@ -30,6 +30,18 @@ import numpy as np  # noqa: E402
 # 中文图表字体：优先选用系统中已安装的 CJK 字体，避免标题/标注里的中文
 # 渲染成方块（'Glyph X missing from font(s) DejaVu Sans'）。找不到时退回默认
 # 字体（此时中文可能缺字，但不报错，英文/数字正常）。
+
+# ----------------------------------------------------------------------
+# 可复现性（NFR-05）：图表抖动用随机数须由 run_config.seed 驱动，
+# 而非硬编码常量——否则同一份数据每次出图抖动不同，破坏可复现性。
+# ----------------------------------------------------------------------
+_CHART_SEED: int = 0
+
+
+def set_chart_seed(seed: int) -> None:
+    """设定图表抖动随机种子（由分析入口按 run_config.seed 注入）。"""
+    global _CHART_SEED
+    _CHART_SEED = int(seed)
 _CJK_FONT_CANDIDATES = [
     "Microsoft YaHei", "Source Han Sans CN", "Noto Sans SC",
     "SimHei", "WenQuanYi Zen Hei", "SimSun",
@@ -243,7 +255,7 @@ def plot_group_comparison(
         [v for v in values_b if v is not None],
     ]
     ax.boxplot(data, tick_labels=[label_a, label_b], showmeans=True)
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(_CHART_SEED)
     for i, vals in enumerate(data, start=1):
         if not vals:
             continue
