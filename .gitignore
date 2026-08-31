@@ -30,3 +30,11 @@ _scratch/
 .pytest_tmp/
 *.avi
 *.mp4
+
+# 模型权重 / 视觉语言模型 (YOLOE / MobileCLIP)，体积大，不进仓库
+*.pt
+*.ts
+weights/
+
+# 智能体内部工作记忆（非项目交付物）
+.workbuddy/

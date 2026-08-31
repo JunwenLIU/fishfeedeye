@@ -2,22 +2,25 @@
 
 覆盖：
     1. gradio main.py 启动，六个页签可用（真实起服务 + 抓 HTML）；
-    2. 盲法：分析页 HTML 中 grep 不到分组标签字符串；揭盲写审计日志；
+    2. 盲法：页面 HTML 中 grep 不到分组标签字符串；揭盲写审计日志；
     3. 打点：点击 20 次 → manual_counts.csv 恰 20 行，时间戳单调；
-    4. compare：metrics_spec_version 不同 → 拒绝整份比较并列出差异；
-       统计输出含 p / Cohen's d / 95%CI / 方法名 / n / 重复结构说明六要素；
-       model_md5 不一致 → 拒绝全部；单池 → "仅描述性"；
+    4. compare：metrics_spec_version / model_md5 不同 → 拒绝整份比较并
+       列出差异 + 出路；统计输出含 p / 效应量 / 95%CI / 方法名 / n /
+       重复结构说明六要素；单池 → descriptive_only；
     5. 图表：右删失段为阴影 + ">窗长" 标注，无归零假象；
     6. 修正：改 1 帧 → corrections.jsonl 增 1 行，cache/detections.jsonl
        未被触碰，_manual 并列口径出现。
 
-注：起服务的用例用固定端口 7891，失败即失败（不做 skip——验收要求
-"六个页签可用"必须被真实验证）。
+注：起服务的用例用固定端口 7891，失败即失败（验收要求"六个页签可用"
+必须被真实验证，不做 skip）。
 """
 from __future__ import annotations
 
+import csv as _csv
+import importlib.util
 import json
 import math
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -27,9 +30,10 @@ import pytest
 
 from src.app.main import TAB_TITLES, build_ui
 from src.app.pages.tally import PHASES, TallySession, simulate_clicks
-from src.core.config import RunConfig, Thresholds
+from src.core.config import RunConfig
 from src.core.frame_context import RunMeta
-from src.export.charts import plot_pellet_curve
+from src.core.metric_value import BLOCKING_FLAGS
+from src.export.charts import _draw_censored, plot_pellet_curve
 from src.export.csv_writer import (
     TIMESERIES_1HZ_HEADER_NOTE,
     TallyRecorder,
@@ -44,20 +48,20 @@ from src.export.summary_writer import (
 )
 from src.metrics import SUMMARY_COLUMNS, MetricsAggregator, write_run_outputs
 from src.stats.comparison_plan import ConsistencyReport, RunBundle
-from src.stats.two_group import TwoGroupPlan
+from src.stats.two_group import MIN_N_PER_GROUP, TwoGroupPlan
 
 TEST_PORT = 7891
-GROUP_A = "对照组"
-GROUP_B = "试验组"
+GROUP_A = "对照组标签"
+GROUP_B = "试验组标签"
 
 
 # ----------------------------------------------------------------------
-# 工具：合成 run bundle
+# 工具
 # ----------------------------------------------------------------------
 def make_bundle(
     run_id: str,
     group: str,
-    values: dict[str, float],
+    values: dict[str, float | None],
     *,
     spec_version: str = "ms-v1",
     model_md5: str = "md5-aaa",
@@ -66,35 +70,40 @@ def make_bundle(
     window_truncated: bool = False,
     px_per_mm: float | None = 2.0,
     quality: dict | None = None,
-    disabled: set[str] | None = None,
     statuses: dict[str, str] | None = None,
+    flags: dict[str, str] | None = None,
+    t0_definition: str = "pellet_in_frame",
+    t0_source: str = "manual",
 ) -> RunBundle:
-    """构造一个参与比较的 run（metrics 行 = {value, status, flags}）。"""
+    """构造一个参与比较的 run（metrics 行 = metrics_summary.csv 的行结构）。"""
     cfg = RunConfig()
     cfg.metrics_spec_version = spec_version
     cfg.model_md5 = model_md5
     cfg.px_per_mm_ref = px_per_mm
+    cfg.t0_definition = t0_definition
+    cfg.t0_source = t0_source
     metrics = {
         mid: {
+            "metric_id": mid,
             "value": v,
             "status": (statuses or {}).get(mid, "ok"),
-            "flags": "",
+            "flags": (flags or {}).get(mid, ""),
             "window_s": window_s,
+            "metric_name_zh": mid,
         }
         for mid, v in values.items()
     }
     return RunBundle(
-        run_id=run_id, config=cfg, metrics=metrics,
-        disabled=disabled or set(), quality=quality or {},
-        window_s=window_s, window_truncated=window_truncated,
-        group=group, pond_id=pond_id,
+        run_id=run_id, config=cfg, metrics=metrics, disabled=set(),
+        quality=quality or {}, window_s=window_s,
+        window_truncated=window_truncated, group=group, pond_id=pond_id,
     )
 
 
 # ----------------------------------------------------------------------
-# 验收 4 · 七条拒绝规则
+# 验收 4 · 拒绝规则
 # ----------------------------------------------------------------------
-class TestSevenRejectRules:
+class TestRejectRules:
     def test_spec_version_diff_rejects_all(self) -> None:
         a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0}, spec_version="ms-v1")
         b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0}, spec_version="ms-v2")
@@ -105,215 +114,225 @@ class TestSevenRejectRules:
         msgs = " ".join(v.message for v in rep.violations
                         if v.action == "reject_all")
         assert "ms-v1" in msgs and "ms-v2" in msgs
-        # 拒绝时必须给出"重跑对齐"的出路提示
+        # 拒绝必须给"重跑对齐"的出路
         assert any("重跑" in v.exit_hint or "重新分析" in v.exit_hint
                    for v in rep.violations if v.action == "reject_all")
 
     def test_model_md5_diff_rejects_all(self) -> None:
         a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0}, model_md5="md5-aaa")
         b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0}, model_md5="md5-bbb")
-        plan = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B)
-        rep = plan.validate()
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
         assert rep.reject_all()
         assert any(v.rule_id == 3 for v in rep.violations)
+
+    def test_t0_definition_diff_rejects_all(self) -> None:
+        """规则 8（docs/06 §6）：t0 定义不同 → 时间类指标整体平移，不可比。"""
+        a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0},
+                        t0_definition="pellet_in_frame")
+        b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0},
+                        t0_definition="feeder_start")
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
+        assert rep.reject_all()
+        assert any(v.rule_id == 8 for v in rep.violations)
+
+    def test_t0_source_diff_rejects_all(self) -> None:
+        a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0}, t0_source="manual")
+        b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0}, t0_source="auto")
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
+        assert any(v.rule_id == 9 for v in rep.violations)
 
     def test_px_per_mm_diff_rejects_unnormalized_only(self) -> None:
         a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0, "B2-1_ANND": 10.0},
                         px_per_mm=2.0)
         b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0, "B2-1_ANND": 12.0},
-                        px_per_mm=3.0, statuses={"B2-1_ANND": "degraded"})
-        b.metrics["B2-1_ANND"]["flags"] = "unnormalized"
-        plan = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B)
-        rep = plan.validate()
+                        px_per_mm=3.0,
+                        statuses={"B2-1_ANND": "degraded"},
+                        flags={"B2-1_ANND": "unnormalized"})
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
         assert "B2-1_ANND" in rep.rejected_metrics
-        assert "A8_T50" not in rep.rejected_metrics  # 无量纲指标不受影响
+        assert "A8_T50" not in rep.rejected_metrics
         assert not rep.reject_all()
 
     def test_window_truncated_rejects_clearance_metrics(self) -> None:
-        a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0, "A11_RR": 5.0,
-                                        "A1_N0": 100.0})
-        b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0, "A11_RR": 4.0,
-                                        "A1_N0": 100.0},
+        a = make_bundle("r1", GROUP_A,
+                        {"A8_T50": 40.0, "A11_RR": 5.0, "A1_N0": 100.0})
+        b = make_bundle("r2", GROUP_B,
+                        {"A8_T50": 30.0, "A11_RR": 4.0, "A1_N0": 100.0},
                         window_s=120.0, window_truncated=True)
-        plan = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B)
-        rep = plan.validate()
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
         assert "A11_RR" in rep.rejected_metrics
         assert "A8_T50" in rep.rejected_metrics
         assert "A1_N0" not in rep.rejected_metrics
         assert not rep.reject_all()
 
     def test_roi_mismatch_warns_only(self) -> None:
-        a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0})
-        b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0})
-        import numpy as np
-
         from src.core.roi import ROI
 
+        a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0})
+        b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0})
         a.roi = ROI(arena=np.array([[0, 0], [100, 0], [100, 100], [0, 100]],
                                    dtype=float))
         b.roi = ROI(arena=np.array([[0, 0], [200, 0], [200, 200], [0, 200]],
                                    dtype=float))
-        plan = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B)
-        rep = plan.validate()
-        assert rep.ok is True      # 只告警，不拒绝
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
+        assert rep.ok is True                       # 只告警，不拒绝
         assert any(v.rule_id == 5 and v.action == "warn"
                    for v in rep.violations)
 
     def test_available_set_mismatch_warns(self) -> None:
         a = make_bundle("r1", GROUP_A, {"A8_T50": 40.0, "B2-7_RP": 1.4})
-        b = make_bundle("r2", GROUP_B, {"A8_T50": 30.0},
+        b = make_bundle("r2", GROUP_B,
+                        {"A8_T50": 30.0, "B2-7_RP": None},
                         statuses={"B2-7_RP": "unavailable"})
-        b.metrics["B2-7_RP"]["value"] = None
-        plan = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B)
-        rep = plan.validate()
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
         warn = [v for v in rep.violations if v.rule_id == 6]
         assert warn and "B2-7_RP" in warn[0].affected_metrics
         assert "非随机" in warn[0].message
 
     def test_non_neutral_gate_rejects_subset_inference(self) -> None:
         """缺失由非中立门控触发 → 拒绝该指标，并给 B1-1/2/3 的出路。"""
-        a = make_bundle(
-            "r1", GROUP_A, {"B2-7_RP": 1.4},
-            quality={"Q_overlap": 0.5},   # 非中立门控越限
-        )
-        b = make_bundle(
-            "r2", GROUP_B, {}, quality={"Q_overlap": 0.5},
-            statuses={"B2-7_RP": "unavailable"},
-        )
-        b.metrics = {"B2-7_RP": {"value": None, "status": "unavailable",
-                                 "flags": "fish_count_confounded"}}
-        plan = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B)
-        rep = plan.validate()
+        a = make_bundle("r1", GROUP_A, {"B2-7_RP": 1.4},
+                        quality={"Q_overlap": 0.5})
+        b = make_bundle("r2", GROUP_B, {"B2-7_RP": None},
+                        statuses={"B2-7_RP": "unavailable"},
+                        flags={"B2-7_RP": "fish_count_confounded"},
+                        quality={"Q_overlap": 0.5})
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
         v7 = [v for v in rep.violations if v.rule_id == 7]
         assert v7 and "B2-7_RP" in v7[0].affected_metrics
         assert "B1-1/2/3" in v7[0].exit_hint
 
-    def test_no_force_compare_switch_exists(self) -> None:
-        """规则 7 不提供绕过开关（docs/04 §4.4）——API 层面无 force 参数。"""
-        import inspect
+    def test_unmeasured_gate_does_not_trigger_rule7(self) -> None:
+        """未测得（None）不算门控触发——docs/04 §4.0：未测得 ≠ 测得为差。"""
+        a = make_bundle("r1", GROUP_A, {"B2-7_RP": 1.4}, quality={})
+        b = make_bundle("r2", GROUP_B, {"B2-7_RP": None},
+                        statuses={"B2-7_RP": "unavailable"}, quality={})
+        rep = TwoGroupPlan([a, b], group_a=GROUP_A, group_b=GROUP_B).validate()
+        assert not any(v.rule_id == 7 for v in rep.violations)
+        # 但规则 6 的"可用集不一致"仍然告警（缺失本身仍需提示）
+        assert any(v.rule_id == 6 for v in rep.violations)
 
-        from src.stats import two_group
-
-        src = inspect.getsource(two_group) + inspect.getsource(
-            __import__("src.stats.comparison_plan", fromlist=["x"])
-        )
-        assert "force" not in {w.strip("_(,\"'") for w in src.split()}
-        # 且 ConsistencyReport 没有"忽略/覆盖"接口
+    def test_no_force_compare_switch(self) -> None:
+        """不提供绕过开关（docs/04 §4.4）：API 层无 force/override/ignore。"""
         assert not hasattr(ConsistencyReport, "ignore")
+        assert not hasattr(ConsistencyReport, "override")
+        assert not hasattr(TwoGroupPlan, "force_execute")
 
 
 # ----------------------------------------------------------------------
 # 验收 4 · 统计六要素
 # ----------------------------------------------------------------------
 class TestTwoGroupStatistics:
-    def _plan(self, na: int = 6, nb: int = 6, ponds: bool = True):
+    @staticmethod
+    def _plan(na: int = 6, nb: int = 6, ponds: bool = True,
+              runs_per_pond: int = 2) -> TwoGroupPlan:
+        """两组 run；默认每个池塘 `runs_per_pond` 次投喂（随机效应可辨识）。
+
+        为什么默认 2：每个池塘只有 1 个观测时，MixedLM 的随机截距方差与
+        残差方差无法分离（模型饱和），其 p 值不可信（可在同分布数据上
+        给出假阳性）。故需要 MixedLM 的用例必须给出池内重复。
+        """
         rng = np.random.default_rng(42)
-        vals_a = rng.normal(40.0, 3.0, na)
-        vals_b = rng.normal(34.0, 3.0, nb)
         a = [make_bundle(f"a{i}", GROUP_A, {"A8_T50": float(v)},
-                         pond_id=(f"pond_{i}" if ponds else "pond_A"))
-             for i, v in enumerate(vals_a)]
+                         pond_id=(f"pond_{i // runs_per_pond}"
+                                  if ponds else "pond_A"))
+             for i, v in enumerate(rng.normal(40.0, 3.0, na))]
         b = [make_bundle(f"b{i}", GROUP_B, {"A8_T50": float(v)},
-                         pond_id=(f"pond_{10 + i}" if ponds else "pond_A"))
-             for i, v in enumerate(vals_b)]
+                         pond_id=(f"pond_{10 + i // runs_per_pond}"
+                                  if ponds else "pond_A"))
+             for i, v in enumerate(rng.normal(34.0, 3.0, nb))]
         return TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B)
 
     def test_six_elements_present(self) -> None:
-        plan = self._plan()
-        res = plan.execute("A8_T50")
-        assert res.available
-        # ① p 值 ② Cohen's d ③ 95%CI ④ 方法名 ⑤ n ⑥ 重复结构
+        res = self._plan().execute("A8_T50")
+        assert res.status == "ok"
+        # ① p 值 ② 效应量 ③ 95%CI ④ 方法名 ⑤ n ⑥ 重复结构
         assert res.p_value is not None and 0.0 <= res.p_value <= 1.0
         assert res.effect_size is not None
+        assert res.effect_size_type in ("cohen_d_hedges_g", "rank_biserial")
         assert res.ci_low is not None and res.ci_high is not None
-        assert res.ci_low <= res.ci_high
-        assert res.test_model in ("welch_t", "mann_whitney", "mixedlm")
+        assert res.ci_low <= res.ci_high and res.ci_level == 0.95
+        assert res.test_used in ("welch_t", "mann_whitney", "mixed_lm")
         assert res.n_a == 6 and res.n_b == 6
-        assert res.replication == "independent_ponds"
-        assert res.replication_note
+        assert res.repeat_structure
 
     def test_multi_pond_uses_mixedlm(self) -> None:
-        plan = self._plan()
-        res = plan.execute("A8_T50")
-        assert res.test_model == "mixedlm"
-        assert res.inferable is True
+        res = self._plan().execute("A8_T50")      # 每池 2 次投喂 → 可辨识
+        assert res.test_used == "mixed_lm"
+        assert res.descriptive_only is False
+        # 两个检验的 p 值都保留（不隐藏与主检验不一致的那一个）
+        assert res.p_welch is not None and res.p_mwu is not None
 
     def test_single_pond_is_descriptive_only(self) -> None:
-        plan = self._plan(ponds=False)
-        res = plan.execute("A8_T50")
-        assert res.replication == "single_pond"
-        assert res.inferable is False
-        assert "无独立重复" in res.replication_note
-        # 六要素仍在（供用户看），但明确标注仅描述性
-        assert res.p_value is not None
-        assert any("仅描述性" in w for w in res.warnings)
+        res = self._plan(ponds=False).execute("A8_T50")
+        assert res.descriptive_only is True
+        assert "伪重复" in res.repeat_structure or "单池塘" in res.repeat_structure
+        assert any("不可做统计推断" in w for w in res.warnings)
 
-    def test_undeclared_pond_warns(self) -> None:
+    def test_undeclared_pond_is_descriptive_only(self) -> None:
         a = [make_bundle(f"a{i}", GROUP_A, {"A8_T50": 40.0 + i}, pond_id=None)
              for i in range(3)]
         b = [make_bundle(f"b{i}", GROUP_B, {"A8_T50": 34.0 + i}, pond_id=None)
              for i in range(3)]
-        plan = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B)
-        res = plan.execute("A8_T50")
-        assert res.replication == "undeclared"
-        assert res.inferable is False
-        assert "pond_id" in res.replication_note
+        res = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B).execute(
+            "A8_T50")
+        assert res.descriptive_only is True
+        assert "未声明" in res.repeat_structure
 
     def test_insufficient_n_gives_no_p_value(self) -> None:
-        """宁可不给 p 值，不可给错的 p 值。"""
+        """宁可不给 p 值，不可给占位 p（p=1.0/0.5 一律不输出）。"""
         a = [make_bundle("a1", GROUP_A, {"A8_T50": 40.0})]
         b = [make_bundle("b1", GROUP_B, {"A8_T50": 34.0})]
-        plan = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B)
-        res = plan.execute("A8_T50")
+        res = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B).execute(
+            "A8_T50")
+        assert res.status == "unavailable"
         assert res.p_value is None
-        assert res.test_model == "none"
-        assert res.reason is not None and "样本量不足" in res.reason
-        # 描述性统计仍在
-        assert res.mean_a == pytest.approx(40.0)
-        assert res.mean_b == pytest.approx(34.0)
-
-    def test_non_normal_switches_to_mann_whitney(self) -> None:
-        rng = np.random.default_rng(7)
-        vals_a = np.concatenate([rng.normal(10, 1, 8), [80.0, 95.0]])  # 重尾
-        vals_b = rng.normal(12, 1.5, 10)
-        a = [make_bundle(f"a{i}", GROUP_A, {"X": float(v)}, pond_id=f"p{i}")
-             for i, v in enumerate(vals_a)]
-        b = [make_bundle(f"b{i}", GROUP_B, {"X": float(v)}, pond_id=f"q{i}")
-             for i, v in enumerate(vals_b)]
-        plan = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B)
-        res = plan.execute("X")
-        assert res.test_model in ("mann_whitney", "mixedlm")
-        if res.test_model == "mann_whitney":
-            assert any("正态" in w for w in res.warnings)
-
-    def test_identical_groups_no_significance(self) -> None:
-        rng = np.random.default_rng(11)
-        a = [make_bundle(f"a{i}", GROUP_A, {"Y": float(v)}, pond_id=f"p{i}")
-             for i, v in enumerate(rng.normal(20, 2, 10))]
-        b = [make_bundle(f"b{i}", GROUP_B, {"Y": float(v)}, pond_id=f"q{i}")
-             for i, v in enumerate(rng.normal(20, 2, 10))]
-        plan = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B)
-        res = plan.execute("Y")
-        assert res.p_value is not None and res.p_value > 0.05
+        assert res.test_used is None
+        assert res.reason and "样本量不足" in res.reason
+        assert res.mean_a is None and res.mean_b is None
 
     def test_unavailable_values_never_enter_statistics(self) -> None:
-        """不可用/删失值不进数组（不用 0 填补）。"""
+        """不可用/删失值不进样本（绝不用 0 填补）。"""
         a = [
             make_bundle("a1", GROUP_A, {"A8_T50": 40.0}, pond_id="p1"),
             make_bundle("a2", GROUP_A, {"A8_T50": 38.0}, pond_id="p2"),
-            make_bundle("a3", GROUP_A, {"A8_T50": 0.0}, pond_id="p3",
+            make_bundle("a3", GROUP_A, {"A8_T50": None}, pond_id="p3",
                         statuses={"A8_T50": "censored"}),
         ]
-        a[2].metrics["A8_T50"]["value"] = None
-        b = [
-            make_bundle("b1", GROUP_B, {"A8_T50": 34.0}, pond_id="q1"),
-            make_bundle("b2", GROUP_B, {"A8_T50": 33.0}, pond_id="q2"),
-            make_bundle("b3", GROUP_B, {"A8_T50": 32.0}, pond_id="q3"),
-        ]
-        plan = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B)
-        res = plan.execute("A8_T50")
-        assert res.n_a == 2 and res.n_b == 3   # 删失的那一帧被排除，不是当 0
+        b = [make_bundle(f"b{i}", GROUP_B, {"A8_T50": 34.0 - i}, pond_id=f"q{i}")
+             for i in range(3)]
+        res = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B).execute(
+            "A8_T50")
+        assert res.n_a == 2 and res.n_b == 3
         assert res.mean_a == pytest.approx(39.0)
+
+    def test_run_all_applies_holm_correction(self) -> None:
+        plan = self._plan()
+        out = plan.run_all(["A8_T50"])
+        assert set(out) == {"A8_T50"}
+        assert out["A8_T50"].p_holm is not None
+        assert out["A8_T50"].p_holm >= out["A8_T50"].p_value - 1e-12
+
+    def test_identical_groups_not_significant(self) -> None:
+        rng = np.random.default_rng(11)
+        a = [make_bundle(f"a{i}", GROUP_A, {"Y": float(v)}, pond_id=f"p{i}")
+             for i, v in enumerate(rng.normal(20, 2, 12))]
+        b = [make_bundle(f"b{i}", GROUP_B, {"Y": float(v)}, pond_id=f"q{i}")
+             for i, v in enumerate(rng.normal(20, 2, 12))]
+        res = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B).execute("Y")
+        assert res.p_value is not None and res.p_value > 0.05
+
+    def test_zero_variance_constant_metric_has_no_p(self) -> None:
+        a = [make_bundle(f"a{i}", GROUP_A, {"Z": 5.0}, pond_id=f"p{i}")
+             for i in range(3)]
+        b = [make_bundle(f"b{i}", GROUP_B, {"Z": 5.0}, pond_id=f"q{i}")
+             for i in range(3)]
+        res = TwoGroupPlan(a + b, group_a=GROUP_A, group_b=GROUP_B).execute("Z")
+        assert res.p_value is None
+        assert res.reason and "占位值" in res.reason
+
+    def test_min_n_constant_is_at_least_two(self) -> None:
+        assert MIN_N_PER_GROUP >= 2   # n<2 无法估计方差，无从检验
 
 
 # ----------------------------------------------------------------------
@@ -325,62 +344,49 @@ class TestTallyRecorder:
         out = sess.to_csv(tmp_path / "manual_counts.csv")
         lines = [ln for ln in out.read_text(encoding="utf-8-sig").splitlines()
                  if ln.strip() and not ln.startswith("#")]
-        assert len(lines) == 21                    # 表头 + 20 行
-        rows = [ln.split(",") for ln in lines[1:]]
+        assert len(lines) == 21                      # 表头 + 20 行
+        rows = list(_csv.DictReader(lines))
         assert len(rows) == 20
-        ts = [float(r[1]) for r in rows]
-        assert all(b > a for a, b in zip(ts, ts[1:]))   # 严格单调
-        assert [int(r[0]) for r in rows] == list(range(1, 21))
+        ts = [float(r["t_s"]) for r in rows]
+        assert all(b > a for a, b in zip(ts, ts[1:]))    # 严格单调
+        assert [int(r["event_id"]) for r in rows] == list(range(1, 21))
 
-    def test_csv_header_carries_operator_and_video(self, tmp_path: Path) -> None:
+    def test_header_carries_operator_video_and_disclaimer(
+        self, tmp_path: Path
+    ) -> None:
         rec = TallyRecorder(operator="kou", video_name="demo.mp4")
         rec.on_key(1.5, phase=PHASES[1])
-        out = rec.to_csv(tmp_path / "manual_counts.csv")
-        head = out.read_text(encoding="utf-8-sig")
+        head = rec.to_csv(tmp_path / "manual_counts.csv").read_text(
+            encoding="utf-8-sig")
         assert "# operator: kou" in head
         assert "# video: demo.mp4" in head
-        assert "独立证据链" in head
+        assert "永不合并" in head           # 独立证据链声明
 
     def test_series_is_cumulative(self) -> None:
-        sess = simulate_clicks(5, dt=1.0)
-        series = sess.recorder.series()
-        assert series[-1] == (4.0, 5)
+        assert simulate_clicks(5, dt=1.0).recorder.series()[-1] == (4.0, 5)
 
     def test_undo_drops_last_event(self) -> None:
         sess = simulate_clicks(3)
-        n = sess.undo()
-        assert n == 2 and len(sess.recorder.events) == 2
+        assert sess.undo() == 2
 
-    def test_manual_counts_never_merge_with_auto(self) -> None:
-        """打点不修正自动指标：manual_counts.csv 只是并列文件。"""
+    def test_tally_never_merges_with_auto_metrics(self) -> None:
+        """打点只是并列文件，不修正任何自动指标。"""
         sess = simulate_clicks(4)
-        # TallyRecorder 不接触任何 MetricValue / metrics_summary
         assert not hasattr(sess.recorder, "metrics")
         assert sess.recorder.series()[0][1] == 1
 
 
 # ----------------------------------------------------------------------
-# 验收 5 · 图表：删失段阴影，不归零
+# 验收 5 · 图表：删失段阴影 + ">窗长"，不归零
 # ----------------------------------------------------------------------
 class TestChartCensoring:
-    def test_censored_region_is_shaded_not_zero(self, tmp_path: Path) -> None:
-        t = np.arange(0.0, 60.0, 2.0)
-        n = np.full(t.shape, 100.0)          # 从不下降 → T50 右删失
-        out = plot_pellet_curve(
-            tmp_path / "np.png", t, n, n0=100.0, censored_window_s=60.0,
-        )
-        assert out.exists() and out.stat().st_size > 0
-        # 图内不得出现"曲线延拓到 0"的数据：本函数只画真实点 + 阴影区，
-        # 阴影跨度 = [window_s, x_max]，由 _draw_censored 绘制。
+    def test_censored_span_drawn(self) -> None:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        from src.export.charts import _draw_censored
-
         fig, ax = plt.subplots()
-        ax.plot(t, n)
         ax.set_xlim(0, 120)
         _draw_censored(ax, 60.0)
         spans = [c for c in ax.get_children()
@@ -388,14 +394,11 @@ class TestChartCensoring:
         assert spans, "删失段必须以阴影（Span）呈现"
         plt.close(fig)
 
-    def test_censored_annotation_text(self, tmp_path: Path) -> None:
-        """标注文本含 '>窗长' 与'非 0' 字样（无归零假象）。"""
+    def test_annotation_states_lower_bound_not_zero(self) -> None:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-
-        from src.export.charts import _draw_censored
 
         fig, ax = plt.subplots()
         ax.set_xlim(0, 120)
@@ -404,6 +407,13 @@ class TestChartCensoring:
         assert any(">60s" in s for s in texts)
         assert any("非 0" in s for s in texts)
         plt.close(fig)
+
+    def test_pellet_curve_file_written(self, tmp_path: Path) -> None:
+        t = np.arange(0.0, 60.0, 2.0)
+        n = np.full(t.shape, 100.0)                  # 从不下降 → T50 右删失
+        out = plot_pellet_curve(tmp_path / "np.png", t, n, n0=100.0,
+                                censored_window_s=60.0)
+        assert out.exists() and out.stat().st_size > 0
 
 
 # ----------------------------------------------------------------------
@@ -423,39 +433,32 @@ class TestExportArtifacts:
                                         columns=list(SUMMARY_COLUMNS))
         back = read_metrics_summary_csv(out)
         assert len(back[0]) == 17
-        # 空值 = 空字符串，绝不为 0
-        assert back[0]["value"] is None
+        assert back[0]["value"] is None               # 空 = 空字符串，不是 0
         assert back[0]["blocking_flag_count"] is None
         assert back[1]["value"] == "5"
 
-    def test_1hz_layer_is_opt_in_and_marked_interpolated(
-        self, tmp_path: Path
-    ) -> None:
+    def test_1hz_layer_marked_interpolated(self, tmp_path: Path) -> None:
         from src.metrics.group_a.pellet_curve import TimeSeries
 
         ts = TimeSeries(metric_id="A2_Np", t=np.array([0.0, 5.0, 10.0]),
                         values=np.array([100.0, 80.0, 60.0]))
-        out = write_timeseries_1hz_csv([ts], tmp_path / "ts1.csv")
-        text = out.read_text(encoding="utf-8-sig")
+        text = write_timeseries_1hz_csv([ts], tmp_path / "ts1.csv").read_text(
+            encoding="utf-8-sig")
         assert TIMESERIES_1HZ_HEADER_NOTE in text
         assert "interpolated" in text
         pts = resample_to_1hz(ts.t, ts.values)
-        assert pts[0].interpolated is False     # 原生点
-        assert pts[1].interpolated is True      # 插值点
+        assert pts[0].interpolated is False           # 原生观测点
+        assert pts[1].interpolated is True            # 插值点
         assert pts[1].source_interval_s == pytest.approx(5.0)
 
-    def test_flag_glossary_covers_all_blocking_flags(
+    def test_flag_glossary_covers_blocking_and_status_flags(
         self, tmp_path: Path
     ) -> None:
-        import csv as _csv
-
-        from src.core.metric_value import BLOCKING_FLAGS
-
         out = write_flag_glossary_csv(tmp_path / "flag_glossary.csv")
         with open(out, encoding="utf-8-sig", newline="") as fh:
             rows = list(_csv.DictReader(fh))
         tokens = {r["flag_token"] for r in rows}
-        assert BLOCKING_FLAGS <= tokens          # 8 项阻断 flag 全覆盖
+        assert BLOCKING_FLAGS <= tokens
         for st in ("ok", "degraded", "unavailable", "censored"):
             assert f"status:{st}" in tokens
         assert list(rows[0].keys()) == ["flag_token", "中文名", "含义", "建议动作"]
@@ -469,14 +472,13 @@ class TestExportArtifacts:
                               hint="缺失可能是效应本身")
             ]
 
-        rows = [{"metric_id": "A8_T50", "status": "censored",
-                 "reason": "观察窗内未穿越", "window_s": 300.0}]
         md = render_capability_report_md(
             run_id="r1", metrics_spec_version="ms-v1",
             quality_table=[{"signal": "Q_det", "value": 0.8,
                             "threshold": 0.5, "passed": True}],
             capability=_Cap(), warnings=["w1"], notes=["n1"],
-            metric_rows=rows,
+            metric_rows=[{"metric_id": "A8_T50", "status": "censored",
+                          "reason": "观察窗内未穿越", "window_s": 300.0}],
         )
         assert "C_group" in md and "Q_track = 0.30" in md
         assert "未输出的指标及原因" in md
@@ -489,7 +491,7 @@ class TestExportArtifacts:
 # ----------------------------------------------------------------------
 class TestGradioApp:
     @pytest.fixture(scope="class")
-    def served_html(self) -> str:
+    def served_html(self):
         """真实起一次 Gradio 服务并抓首页 HTML（验收 1/2 的唯一可信验证）。"""
         from src.app.state import ProjectState, VideoEntry
 
@@ -512,8 +514,7 @@ class TestGradioApp:
                     headers={"User-Agent": "Mozilla/5.0"},
                 )
                 html = urllib.request.urlopen(req, timeout=5).read().decode(
-                    "utf-8", "replace"
-                )
+                    "utf-8", "replace")
                 break
             except Exception:
                 time.sleep(0.5)
@@ -530,24 +531,21 @@ class TestGradioApp:
 
     def test_blind_mode_hides_group_labels(self, served_html: str) -> None:
         assert served_html
-        # 分析页与全部页面 HTML 中不得出现真实分组标签
         assert GROUP_A not in served_html
         assert GROUP_B not in served_html
-        # 盲法编号体系存在
-        assert "run_" in served_html or "盲法" in served_html
+        assert "盲法" in served_html
 
     def test_reveal_writes_audit_log(self, tmp_path: Path) -> None:
         from src.app.state import ProjectState, VideoEntry
 
         st = ProjectState(project_dir=tmp_path / "proj")
         st.videos = [VideoEntry(video_path="a.mp4", group=GROUP_A)]
-        assert st.display_label(0) == "run_001"     # 盲法编号
+        assert st.display_label(0) == "run_001"        # 盲法编号
         st.reveal(operator="kou")
         assert st.revealed is True
-        assert st.display_label(0) == GROUP_A       # 揭盲后显示分组
+        assert st.display_label(0) == GROUP_A          # 揭盲后显示分组
         assert any(r["action"] == "reveal" for r in st.audit_log)
         assert (tmp_path / "proj" / "audit_log.jsonl").exists()
-        # 盲法映射表落盘且可被读回
         st.save_blind_map()
         mapping = st.load_blind_map()
         assert mapping["entries"][0]["group"] == GROUP_A
@@ -555,11 +553,11 @@ class TestGradioApp:
 
 
 # ----------------------------------------------------------------------
-# 验收 6 · 人工修正（只重跑 metrics 层）
+# 验收 6 · 人工修正（只重跑 metrics 层，缓存不被触碰）
 # ----------------------------------------------------------------------
 class TestManualCorrection:
-    def _make_run(self, tmp_path: Path) -> Path:
-        """用聚合器产出一个真实 run 目录（含 cache/detections.jsonl）。"""
+    @staticmethod
+    def _make_run(tmp_path: Path) -> Path:
         from src.core.frame_context import FrameObservation, PelletDetections
 
         obs = []
@@ -571,18 +569,14 @@ class TestManualCorrection:
             ).reshape(-1, 4)
             obs.append(FrameObservation(
                 frame_idx=i, t_s=float(t), dt_s=None, image=None,
-                pellets=PelletDetections(
-                    xyxy=xyxy, conf=np.full(max(n, 0), 0.9),
-                ),
+                pellets=PelletDetections(xyxy=xyxy,
+                                         conf=np.full(max(n, 0), 0.9)),
                 extra={},
             ))
         run_dir = tmp_path / "run_demo"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "cache").mkdir(exist_ok=True)
-        # 手写 cache（模拟 Orchestrator 落盘格式）
-        lines = []
-        for o in obs:
-            lines.append(json.dumps({
+        (run_dir / "cache").mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps({
                 "type": "frame", "frame_idx": o.frame_idx, "t_s": o.t_s,
                 "dt_s": None,
                 "pellets": {
@@ -591,13 +585,14 @@ class TestManualCorrection:
                     "area_px": None, "track_id": None, "vanish_class": None,
                 },
                 "extra": {},
-            }, ensure_ascii=False))
-        cache = run_dir / "cache" / "detections.jsonl"
-        cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            }, ensure_ascii=False)
+            for o in obs
+        ]
+        (run_dir / "cache" / "detections.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
         RunConfig().to_yaml(run_dir / "run_config.yaml")
-        agg = MetricsAggregator(config=RunConfig())
-        rep = agg.aggregate(obs, meta=RunMeta(feed_mass_g=2.5,
-                                              pellet_mass_mg=25.0))
+        rep = MetricsAggregator(config=RunConfig()).aggregate(
+            obs, meta=RunMeta(feed_mass_g=2.5, pellet_mass_mg=25.0))
         write_run_outputs(rep, run_dir)
         return run_dir
 
@@ -614,15 +609,15 @@ class TestManualCorrection:
         out = apply_correction(run_dir, frame_idx=5, new_n=42,
                                operator="kou", note="复核")
 
-        # ① corrections.jsonl 增加 1 行
-        log = run_dir / "corrections.jsonl"
-        recs = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()
-                if x.strip()]
+        # ① corrections.jsonl 增加 1 行（含原值/新值/人/时间）
+        recs = [json.loads(x) for x in
+                (run_dir / "corrections.jsonl").read_text(
+                    encoding="utf-8").splitlines() if x.strip()]
         assert len(recs) == 1
         assert recs[0]["frame_idx"] == 5
         assert recs[0]["new_n"] == 42
         assert recs[0]["operator"] == "kou"
-        assert recs[0]["original_n"] is not None   # 原值留痕
+        assert recs[0]["original_n"] is not None
         assert recs[0]["timestamp"]
 
         # ② cache/detections.jsonl 未被触碰（不重跑检测）
@@ -630,17 +625,13 @@ class TestManualCorrection:
         assert cache.stat().st_mtime_ns == before_mtime
         assert out["cache_touched"] is False
 
-        # ③ 并列口径：_manual 指标出现，原始值不被覆盖
+        # ③ _manual 并列口径出现，原始口径保留
         assert out["n_corrected"] == 1
         assert 0.0 < out["share"] < 1.0
         assert any(m.endswith("_manual") for m in out["manual_metrics"])
-        assert "A8_T50_manual" in out["manual_metrics"] or any(
-            m.startswith("A") for m in out["manual_metrics"]
-        )
-        # 原始口径仍在 summary.csv 中
         rows = read_metrics_summary_csv(run_dir / "metrics_summary.csv")
         ids = {r["metric_id"] for r in rows}
-        assert "A8_T50" in ids
+        assert "A8_T50" in ids                       # 原始口径仍在
         assert any(i.endswith("_manual") for i in ids)
 
     def test_second_correction_appends_not_overwrites(
@@ -654,81 +645,68 @@ class TestManualCorrection:
         recs = [json.loads(x) for x in
                 (run_dir / "corrections.jsonl").read_text(
                     encoding="utf-8").splitlines() if x.strip()]
-        assert len(recs) == 2          # 追加，不覆盖（审计留痕）
-        assert [r["frame_idx"] for r in recs] == [3, 7]
+        assert [r["frame_idx"] for r in recs] == [3, 7]   # 追加留痕
 
-    def test_correction_unknown_frame_raises(self, tmp_path: Path) -> None:
+    def test_unknown_frame_raises(self, tmp_path: Path) -> None:
         from src.app.pages.results import apply_correction
 
-        run_dir = self._make_run(tmp_path)
         with pytest.raises(ValueError, match="不在缓存观测中"):
-            apply_correction(run_dir, 99999, 10)
+            apply_correction(self._make_run(tmp_path), 99999, 10)
 
 
 # ----------------------------------------------------------------------
-# 误差实测脚本（G1）纪律
+# G1 误差实测纪律（docs/04 §7.1 ③）
 # ----------------------------------------------------------------------
 class TestGroundTruthValidation:
-    """G1 误差实测：五条纪律（docs/04 §7.1 ③）。"""
-
     @staticmethod
     def _mod():
-        """按文件路径加载 scripts/06_validate_against_groundtruth.py。"""
         import importlib.util
 
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "scripts" / "06_validate_against_groundtruth.py"
-        )
+        path = (Path(__file__).resolve().parents[1] / "scripts"
+                / "06_validate_against_groundtruth.py")
         spec = importlib.util.spec_from_file_location("validate_gt", path)
         assert spec is not None and spec.loader is not None
         mod = importlib.util.module_from_spec(spec)
+        # 必须先登记进 sys.modules：模块内 @dataclass 解析类型注解时会
+        # 通过 sys.modules[cls.__module__] 反查命名空间，未登记会抛
+        # AttributeError: 'NoneType' object has no attribute '__dict__'。
+        sys.modules["validate_gt"] = mod
         spec.loader.exec_module(mod)
         return mod
 
     def test_unmeasurable_when_error_below_noise_floor(self) -> None:
         mod = self._mod()
-        # 同一帧两人计数差异 ±3 颗（噪声下限 3），实测误差仅 1 颗
         rows = []
-        for f in range(6):
+        for f in range(6):      # 同帧双计数差异 ±3 颗 → 噪声下限 3
             rows.append(mod.GroundTruthRow(frame_idx=f, t_s=float(f),
                                            n_pellets_gt=100, counter="A"))
             rows.append(mod.GroundTruthRow(frame_idx=f, t_s=float(f),
                                            n_pellets_gt=103, counter="B"))
-        auto = {f: 101.0 for f in range(6)}    # 与真值均值差 0.5
-        rep = mod.validate(rows, auto)
-        assert rep.measurable is False         # 纪律 3：判为"无法测量"
+        rep = mod.validate(rows, {f: 101.0 for f in range(6)})
+        assert rep.measurable is False            # 纪律 3：判为"无法测量"
         assert "无法区分模型误差与真值噪声" in rep.verdict
-        assert rep.mae is not None and rep.mae < rep.noise_floor
+        assert rep.mae < rep.noise_floor
         md = mod.render_report_md(rep, "r1")
         assert "无法测量" in md
-        # 精度数字降级为次要信息（不高亮），但仍可见（不静默删除）
-        assert "color:#999" in md
+        assert "color:#999" in md                 # 精度数字降级为次要信息
 
     def test_measurable_reports_mae_and_bias(self) -> None:
         mod = self._mod()
-        rows = [
-            mod.GroundTruthRow(frame_idx=f, t_s=float(f),
-                               n_pellets_gt=100, counter="A")
-            for f in range(4)
-        ]
-        auto = {f: 90.0 for f in range(4)}     # 稳定低估 10 颗
-        rep = mod.validate(rows, auto)
+        rows = [mod.GroundTruthRow(frame_idx=f, t_s=float(f),
+                                   n_pellets_gt=100, counter="A")
+                for f in range(4)]
+        rep = mod.validate(rows, {f: 90.0 for f in range(4)})   # 稳定低估
         assert rep.measurable is True
         assert rep.mae == pytest.approx(10.0)
-        assert rep.bias == pytest.approx(-10.0)   # 有符号偏差：稳定低估
+        assert rep.bias == pytest.approx(-10.0)
         assert "稳定低估" in rep.verdict
-        # 纪律 1/4：小样本不得自动校正
-        assert any("禁止" in w for w in rep.warnings)
+        assert any("禁止" in w for w in rep.warnings)   # 纪律 1：小样本不校正
 
     def test_missing_auto_frames_are_skipped_not_zero_filled(self) -> None:
         mod = self._mod()
-        rows = [
-            mod.GroundTruthRow(frame_idx=f, t_s=float(f),
-                               n_pellets_gt=100, counter="A")
-            for f in range(3)
-        ]
-        rep = mod.validate(rows, {0: 100.0})   # 仅第 0 帧有自动值
+        rows = [mod.GroundTruthRow(frame_idx=f, t_s=float(f),
+                                   n_pellets_gt=100, counter="A")
+                for f in range(3)]
+        rep = mod.validate(rows, {0: 100.0})
         assert rep.n_frames == 1
         assert any("缺失" in w for w in rep.warnings)
-

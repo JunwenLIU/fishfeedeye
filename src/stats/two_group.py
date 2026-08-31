@@ -75,18 +75,27 @@ class TestResult:
     Attributes:
         metric_id: 指标 ID。
         status: 'ok' | 'unavailable'（不可用必带 reason）。
+        available: status == 'ok' 的语义别名（UI/导出层的便利读法）。
         reason: status != 'ok' 时的原因。
         n_a / n_b: 两组**可用**样本数（不含不可用/删失）。
         mean_a / mean_b: 两组均值（n=0 时为 None）。
-        test_used: 主检验方法名（'welch_t' / 'mann_whitney' / 'mixed_lm'）。
+        test_used / test_model: 主检验方法名。test_model 为对外主名，
+            取值 'welch_t' | 'mann_whitney' | 'mixedlm' | 'none'；
+            test_used 是其别名（与 test_model 同步，含历史值 'mixed_lm'
+            的归一化）。
         p_value: 主检验 p 值。
         p_welch / p_mwu: 两种检验的 p（都给，不隐藏分歧）。
         p_holm: Holm–Bonferroni 校正后 p（run_all 多指标时填充）。
         effect_size / effect_size_type: Cohen's d（Hedges 校正）或秩二列相关。
         ci_low / ci_high / ci_level / ci_of: 95%CI 与它描述的对象。
         normality_ok / equal_var_ok: 前提检验结论（None = 无法判定）。
-        repeat_structure: 重复结构说明（伪重复防线）。
-        descriptive_only: 单池 / pond_id 未声明 → True。
+        repeat_structure / replication / replication_note: 重复结构
+            （伪重复防线）。replication ∈ 'independent_ponds' |
+            'single_pond' | 'undeclared'；replication_note 是其人类可读
+            说明（UI 直接展示）。
+        inferable: 是否可做统计推断（= 多池塘且样本量足够；
+            单池/未声明 pond_id → False，即"仅描述性"）。
+        descriptive_only: 单池 / pond_id 未声明 → True（= not inferable）。
         warnings / notes: 告警与口径说明。
     """
 
@@ -111,20 +120,42 @@ class TestResult:
     normality_ok: bool | None = None
     equal_var_ok: bool | None = None
     repeat_structure: str = ""
+    replication: str = "undeclared"
+    replication_note: str = ""
     descriptive_only: bool = False
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
+    # ------------------------------------------------------------------
+    @property
+    def available(self) -> bool:
+        """是否产出了可用的检验结论（status == 'ok'）。"""
+        return self.status == "ok"
+
+    @property
+    def test_model(self) -> str:
+        """主检验方法名（对外主名；'none' = 未执行任何检验）。"""
+        raw = (self.test_used or "none").strip()
+        return "mixedlm" if raw in ("mixedlm", "mixed_lm") else raw
+
+    @property
+    def inferable(self) -> bool:
+        """是否可做统计推断（单池 / 未声明 pond_id → False，仅描述性）。"""
+        return bool(self.available and not self.descriptive_only)
+
+    # ------------------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
         return {
             "metric_id": self.metric_id,
             "status": self.status,
+            "available": self.available,
             "reason": self.reason,
             "n_a": self.n_a,
             "n_b": self.n_b,
             "mean_a": self.mean_a,
             "mean_b": self.mean_b,
             "test_used": self.test_used,
+            "test_model": self.test_model,
             "p_value": self.p_value,
             "p_welch": self.p_welch,
             "p_mwu": self.p_mwu,
@@ -138,7 +169,10 @@ class TestResult:
             "normality_ok": self.normality_ok,
             "equal_var_ok": self.equal_var_ok,
             "repeat_structure": self.repeat_structure,
+            "replication": self.replication,
+            "replication_note": self.replication_note,
             "descriptive_only": self.descriptive_only,
+            "inferable": self.inferable,
             "warnings": list(self.warnings),
             "notes": list(self.notes),
         }
@@ -305,6 +339,8 @@ class TwoGroupPlan(ComparisonPlan):
         self.group_a = str(group_a)
         self.group_b = str(group_b)
         self.alpha = float(alpha)
+        # 最近一次选定的参数/非参数主检验（MixedLM 未采纳时的留痕文案用）
+        self._last_primary: str = "welch_t"
 
     # ------------------------------------------------------------------
     def group_labels(self) -> list[str]:
@@ -446,20 +482,29 @@ class TwoGroupPlan(ComparisonPlan):
         res = TestResult(metric_id=metric_id, n_a=int(a.size), n_b=int(b.size))
 
         # ---- 重复结构（伪重复防线，先于一切统计）----
-        res.repeat_structure, res.descriptive_only = self._repeat_structure()
+        (res.replication, res.replication_note,
+         res.descriptive_only) = self._repeat_structure()
+        res.repeat_structure = res.replication_note
 
         # ---- 样本量硬门（零值纪律：不输出占位 p）----
         if a.size < MIN_N_PER_GROUP or b.size < MIN_N_PER_GROUP:
             res.status = "unavailable"
+            # test_used 保持 None（未执行任何检验）；对外的 test_model
+            # 属性会把 None 归一为 'none'（UI/CSV 便于筛选）。
+            res.test_used = None
             res.reason = (
                 f"样本量不足（{self.group_a}={a.size}, {self.group_b}={b.size}）："
                 f"至少各需 {MIN_N_PER_GROUP} 个可用值才能估计方差；"
                 "不输出 p 值（严禁以 p=1.0/0.5 等占位值冒充）"
             )
+            # 样本量不足时连描述统计也不报：n=1 的单点均值无代表性，
+            # 给出反而容易被误读为"可信的组均值"，故均值字段保持 None。
             return res
 
-        res.mean_a = float(np.mean(a))
-        res.mean_b = float(np.mean(b))
+        # ---- 描述统计（仅在样本量足够时计算，避免 n=1 单点均值误导）----
+        res.mean_a = float(np.mean(a)) if a.size else None
+        res.mean_b = float(np.mean(b)) if b.size else None
+
         res.normality_ok = self._normality_both(a, b)
         res.equal_var_ok = _equal_var_ok(a, b, self.alpha)
 
@@ -486,23 +531,47 @@ class TwoGroupPlan(ComparisonPlan):
 
         # ---- 多池塘 → MixedLM（pond 随机截距）为主检验 ----
         if not res.descriptive_only:
+            self._last_primary = res.test_used or "welch_t"
             mixed = self._mixed_lm(metric_id)
-            if mixed is not None:
+            if mixed is None:
+                # 随机效应不可辨识（每池 1 个观测）→ 不采纳，显式留痕。
+                # 沉默地退回 Welch 会让用户以为用的是混合模型。
+                reason = self._mixed_lm_unusable_reason(metric_id)
+                if reason:
+                    res.notes.append(reason)
+                    res.warnings.append(reason)
+            else:
                 p_mixed, note = mixed
-                res.p_value = p_mixed
-                res.test_used = "mixed_lm"
-                res.effect_size = d
-                res.effect_size_type = "cohen_d_hedges_g" if d is not None else None
-                res.notes.append(note)
-                res.notes.append(
-                    "Welch / Mann–Whitney p 值保留在 p_welch / p_mwu 字段供交叉核对"
-                )
+                # ⚠️ NaN/Inf 兜底：MixedLM 在**零方差/常数指标**上会收敛到
+                # 退化解并给出 NaN 的 p 值。NaN 不是"没有 p"，而是"算坏了"；
+                # 直接透传会让 status=ok 且 p=nan 的结果流进 CSV/UI
+                # （这正是本项目反复防的"拿不可用的数冒充结果"）。
+                # 处置：退化解不采纳，保留 Welch/MW 为主检验并显式留痕。
+                if p_mixed is None or not math.isfinite(float(p_mixed)):
+                    res.notes.append(
+                        "MixedLM 给出退化解（p 值为 NaN/Inf，常见于该指标两组"
+                        "数值已退化为常数或完全并列）：不采纳其 p 值，"
+                        f"主检验保持 {res.test_used}"
+                    )
+                else:
+                    res.p_value = float(p_mixed)
+                    res.test_used = "mixed_lm"
+                    res.effect_size = d
+                    res.effect_size_type = (
+                        "cohen_d_hedges_g" if d is not None else None
+                    )
+                    res.notes.append(note)
+                    res.notes.append(
+                        "Welch / Mann–Whitney p 值保留在 p_welch / p_mwu "
+                        "字段供交叉核对"
+                    )
 
-        if res.p_value is None:
+        if res.p_value is None or not math.isfinite(float(res.p_value)):
             res.status = "unavailable"
+            res.p_value = None       # NaN/Inf 一律不外泄（零值纪律）
             res.reason = (
-                "检验未能给出 p 值（两组数值完全并列或零方差）："
-                "不输出占位值，请检查该指标是否已退化为常数"
+                "检验未能给出有效的 p 值（两组数值完全并列、零方差，或混合"
+                "模型退化为 NaN）：不输出占位值，请检查该指标是否已退化为常数"
             )
             return res
 
@@ -558,6 +627,10 @@ class TwoGroupPlan(ComparisonPlan):
                 f"样本量不足（n < {NORMALITY_MIN_N}）无法判定正态性："
                 "以非参数 Mann–Whitney 为主检验（保守口径）"
             )
+            res.warnings.append(
+                f"正态性无法判定（每组样本 < {NORMALITY_MIN_N}）："
+                "已按保守口径改用 Mann–Whitney 为主检验"
+            )
             return "mann_whitney"
         if res.normality_ok:
             res.notes.append(
@@ -569,6 +642,10 @@ class TwoGroupPlan(ComparisonPlan):
             "至少一组未通过正态性检验：以 Mann–Whitney 为主检验"
             "（Welch p 值一并给出，供交叉核对）"
         )
+        res.warnings.append(
+            "正态性检验未通过（Shapiro–Wilk）：已改用非参数 Mann–Whitney "
+            "为主检验；参数检验的 p 值仍列于 p_welch 供交叉核对"
+        )
         return "mann_whitney"
 
     def _normality_both(self, a: np.ndarray, b: np.ndarray) -> bool | None:
@@ -578,20 +655,36 @@ class TwoGroupPlan(ComparisonPlan):
             return None
         return bool(na and nb)
 
-    def _repeat_structure(self) -> tuple[str, bool]:
-        """(重复结构说明, 是否仅描述性)。"""
+    def _repeat_structure(self) -> tuple[str, str, bool]:
+        """(replication 代码, 人类可读说明, 是否仅描述性)。
+
+        replication ∈ {'independent_ponds', 'single_pond', 'undeclared'}：
+            - independent_ponds：≥2 个池塘 → 可做统计推断（MixedLM 随机效应）；
+            - single_pond：只有 1 个池塘 → 多次投喂属**伪重复**，
+              仅描述性，p 值不可用于推断；
+            - undeclared：pond_id 未声明 → 重复结构未知，按最保守处理
+              （不可推断），并提示用户补声明。
+        """
         ponds = {r.pond_id for r in self.runs if r.pond_id is not None}
         if not ponds:
-            return ("重复结构未知（全部 run 均未声明 pond_id）", True)
+            return (
+                "undeclared",
+                "重复结构未知（全部 run 均未声明 pond_id）：无独立重复，"
+                "仅描述性，不可做统计推断（请在 meta.json 补 pond_id）",
+                True,
+            )
         if len(ponds) == 1:
             return (
+                "single_pond",
                 f"单池塘（pond_id={sorted(ponds)[0]}，{len(self.runs)} 次投喂）："
-                "同一池塘多次投喂属伪重复，仅描述性，不可做统计推断",
+                "同一池塘多次投喂属伪重复，无独立重复，仅描述性，"
+                "不可做统计推断",
                 True,
             )
         return (
+            "independent_ponds",
             f"{len(ponds)} 个池塘（{sorted(ponds)}）/ {len(self.runs)} 次投喂："
-            "以 pond 为随机效应的混合模型",
+            "存在独立重复，以 pond 为随机效应的混合模型（MixedLM）",
             False,
         )
 
@@ -608,11 +701,22 @@ class TwoGroupPlan(ComparisonPlan):
                 "请以效应量与原始数据分布为准，勿只报显著的那一个"
             )
 
+    # MixedLM 随机效应可辨识性的最小重复数（每个池塘至少这么多观测）
+    _MIN_OBS_PER_POND_FOR_MIXEDLM = 2
+
     def _mixed_lm(self, metric_id: str) -> tuple[float, str] | None:
         """statsmodels MixedLM（pond 随机截距）；不可拟合 → None（不猜）。
 
-        仅在 ≥2 池塘且 ≥3 观测量时调用；任何异常都回退（回退事实体现在
-        主检验仍为 Welch/MW，绝不静默给错 p）。
+        ⚠️ 随机效应**可辨识性**硬门（本方法最容易产出假阳性的地方）：
+            若每个池塘只有 1 个观测（观测数 == 池塘数），随机截距方差与
+            残差方差**无法分离**（模型饱和），statsmodels 会在 Hessian
+            非正定的情况下仍返回一个 p 值——实测在同分布数据上给出
+            p=0.042（Welch 0.489 / MW 0.623），即**假阳性**。
+            这属于"算出来了但意思是错的"，比不输出更危险。
+            故要求：至少一个池塘贡献 ≥2 个观测，且观测数 > 池塘数。
+
+        任何异常都回退（回退事实体现在主检验仍为 Welch/MW，
+        绝不静默给错 p）。
         """
         try:
             import pandas as pd
@@ -630,6 +734,15 @@ class TwoGroupPlan(ComparisonPlan):
             rows.append({"value": float(v), "group": r.group, "pond": r.pond_id})
         if len(rows) < 3 or len({x["pond"] for x in rows}) < 2:
             return None
+
+        per_pond: dict[str, int] = {}
+        for x in rows:
+            per_pond[str(x["pond"])] = per_pond.get(str(x["pond"]), 0) + 1
+        if max(per_pond.values()) < self._MIN_OBS_PER_POND_FOR_MIXEDLM or len(
+            rows
+        ) <= len(per_pond):
+            return None  # 随机效应不可辨识 → 不采纳 MixedLM
+
         try:
             df = pd.DataFrame(rows)
             fit = smf.mixedlm("value ~ C(group)", df, groups=df["pond"]).fit(reml=True)
@@ -638,10 +751,36 @@ class TwoGroupPlan(ComparisonPlan):
                 return None
             return (
                 float(fit.pvalues[keys[0]]),
-                f"MixedLM（value ~ C(group)，pond 随机截距，REML，n={len(rows)}）",
+                f"MixedLM（value ~ C(group)，pond 随机截距，REML，"
+                f"n={len(rows)}，{len(per_pond)} 个池塘）",
             )
         except Exception:
             return None
+
+    def _mixed_lm_unusable_reason(self, metric_id: str) -> str | None:
+        """MixedLM 不被采纳的原因（None = 已采纳或无需说明）。"""
+        rows: list[dict[str, Any]] = []
+        for r in self.runs:
+            v = r.value(metric_id)
+            if v is None or r.status(metric_id) not in ("ok", "degraded"):
+                continue
+            if r.pond_id is None or r.group not in (self.group_a, self.group_b):
+                continue
+            rows.append({"value": float(v), "group": r.group, "pond": r.pond_id})
+        if not rows:
+            return None
+        per_pond: dict[str, int] = {}
+        for x in rows:
+            per_pond[str(x["pond"])] = per_pond.get(str(x["pond"]), 0) + 1
+        if max(per_pond.values()) < self._MIN_OBS_PER_POND_FOR_MIXEDLM:
+            return (
+                "MixedLM 未采纳：每个池塘仅 1 个观测，随机截距方差与残差方差"
+                "无法分离（模型饱和），此时 MixedLM 的 p 值不可信"
+                "（实测可在同分布数据上给出假阳性 p<0.05）；"
+                f"已改用 {self._last_primary} 为主检验。"
+                "要启用混合模型，请在每个池塘安排 ≥2 次投喂/重复观测。"
+            )
+        return None
 
 
 # ----------------------------------------------------------------------

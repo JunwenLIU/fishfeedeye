@@ -354,31 +354,59 @@ class ComparisonPlan(ABC):
         except Exception:  # pragma: no cover
             return True
 
+        def _rasterize(poly: Any, xs: Any, ys: Any) -> Any:
+            """矢量化奇偶规则（射线法）栅格化多边形。
+
+            ⚠️ 此处原实现用 `(xs-x_a)(y_b-y_a) − (ys-y_a)(x_b-x_a) > 0` 的
+            "同侧"判据逐边 XOR——该判据对**边与网格边界重合**的轴对齐矩形
+            恒不翻转（cross 恰为 0），导致整个掩膜为空 ⇒ 两个完全相同的
+            ROI 算出 IoU=0 ⇒ 规则 5 对每一次合法比较都误报告警
+            （已实测复现：`_roi_consistent([roi, roi]) is False`）。
+            误报告警会侵蚀整套告警体系的可信度（狼来了效应），故改为
+            标准射线法：只统计**跨越水平射线**的边，且用半开区间
+            `(y_a > y) != (y_b > y)` 避免顶点被重复计数。
+            """
+            pts_p = np.asarray(poly, dtype=float)
+            inside = np.zeros(xs.shape, dtype=bool)
+            n = len(pts_p)
+            if n < 3:
+                return inside
+            x_a, y_a = float(pts_p[0, 0]), float(pts_p[0, 1])
+            with np.errstate(invalid="ignore", divide="ignore"):
+                for i in range(1, n + 1):
+                    x_b, y_b = float(pts_p[i % n, 0]), float(pts_p[i % n, 1])
+                    crosses = (y_a > ys) != (y_b > ys)
+                    dy = y_b - y_a
+                    x_int = np.where(
+                        np.abs(dy) < 1e-12,
+                        np.inf,
+                        x_a + (ys - y_a) / dy * (x_b - x_a),
+                    )
+                    inside ^= crosses & (xs < x_int)
+                    x_a, y_a = x_b, y_b
+            return inside
+
         def _poly_iou(a: Any, b: Any) -> tuple[float, float]:
-            """(面积比, IoU)——用栅格近似，避免引入 shapely 依赖。"""
+            """(面积比, IoU)——栅格近似，避免引入 shapely 依赖。"""
             pts = np.vstack([np.asarray(a, dtype=float),
                              np.asarray(b, dtype=float)])
             (x0, y0), (x1, y1) = pts.min(axis=0), pts.max(axis=0)
             w = h = 128
-            mask_a = np.zeros((h, w), dtype=bool)
-            mask_b = np.zeros((h, w), dtype=bool)
-            for mask, poly in ((mask_a, a), (mask_b, b)):
+            masks: list[Any] = []
+            for poly in (a, b):
                 pts_p = np.asarray(poly, dtype=float).copy()
                 pts_p[:, 0] = (pts_p[:, 0] - x0) / max(x1 - x0, 1e-9) * (w - 1)
                 pts_p[:, 1] = (pts_p[:, 1] - y0) / max(y1 - y0, 1e-9) * (h - 1)
                 ys, xs = np.mgrid[0:h, 0:w]
-                inside = np.zeros((h, w), dtype=bool)
-                for i in range(len(pts_p)):
-                    x_a, y_a = pts_p[i]
-                    x_b, y_b = pts_p[(i + 1) % len(pts_p)]
-                    cross = ((xs - x_a) * (y_b - y_a)
-                             - (ys - y_a) * (x_b - x_a))
-                    inside ^= cross > 0
-                mask[:] = inside
+                masks.append(_rasterize(pts_p, xs, ys))
+            mask_a, mask_b = masks
             inter = float(np.count_nonzero(mask_a & mask_b))
             union = float(np.count_nonzero(mask_a | mask_b))
-            return (inter / max(inter, 1e-9),
-                    inter / union if union > 0 else 0.0)
+            if union == 0:
+                # 两个掩膜都为空（退化多边形）：无从判定 → 保守判为一致，
+                # 绝不因无法计算就报"不一致"。
+                return 1.0, 1.0
+            return (inter / max(inter, 1e-9), inter / union)
 
         base = rois[0]
         for other in rois[1:]:
