@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -23,22 +25,43 @@ ROOT = Path(__file__).resolve().parents[1]
 SIZE = (320, 240)
 
 
+def _subprocess_env() -> dict[str, str]:
+    """子进程环境：UTF-8 输出防 GBK 乱码，PATH 清空避免污染。
+
+    注意：必须透传临时目录相关变量。Windows 上若 TEMP/TMP 缺失，
+    tempfile.gettempdir() 会退化为 '~\\AppData\\Local\\Temp'、
+    '%SYSTEMROOT%\\Temp'、'c:\\temp' 等字面量路径并全部找不到，
+    导致 matplotlib 等依赖临时目录的库在 import 阶段直接抛
+    FileNotFoundError。此处显式透传，保证测试在任何机器上都可用。
+    """
+    env = {
+        "PYTHONIOENCODING": "utf-8",
+        "PATH": "",
+        "TEMP": tempfile.gettempdir(),
+        "TMP": tempfile.gettempdir(),
+        "TMPDIR": tempfile.gettempdir(),
+    }
+    # Windows 上 tempfile 还会尝试 %SYSTEMROOT%\Temp，透传以便兜底可用
+    for key in ("SYSTEMROOT", "SystemRoot", "USERPROFILE"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
 def _run(args: list[str]) -> subprocess.CompletedProcess:
     """直跑脚本（与用户命令行一致），UTF-8 输出防 GBK 乱码。"""
-    env = {"PYTHONIOENCODING": "utf-8", "PATH": ""}
     return subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "run_cli.py")] + args,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=str(ROOT), env=env, timeout=300,
+        cwd=str(ROOT), env=_subprocess_env(), timeout=300,
     )
 
 
 def _run_00(args: list[str]) -> subprocess.CompletedProcess:
-    env = {"PYTHONIOENCODING": "utf-8", "PATH": ""}
     return subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "00_calibrate_pellet_dynamics.py")] + args,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=str(ROOT), env=env, timeout=300,
+        cwd=str(ROOT), env=_subprocess_env(), timeout=300,
     )
 
 
